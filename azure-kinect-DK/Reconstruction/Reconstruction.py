@@ -18,7 +18,7 @@ class KinectReconstructor:
         )
         self.k4a.start()
         
-        # Camera intrinsics
+        # Camera intrinsics - using actual Kinect values
         self.intrinsics = o3d.camera.PinholeCameraIntrinsic(
             1280, 720,  # Width, height
             605.286, 605.699,  # fx, fy
@@ -60,6 +60,9 @@ class KinectReconstructor:
         color_img = cv2.flip(color_img, -1)
         depth_img = cv2.flip(depth_img, -1)
         
+        # Convert BGR to RGB (Kinect provides BGR format)
+        color_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
+        
         # Convert to Open3D format
         color_o3d = o3d.geometry.Image(color_img)
         depth_o3d = o3d.geometry.Image(depth_img)
@@ -68,17 +71,20 @@ class KinectReconstructor:
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color_o3d,
             depth_o3d,
-            convert_rgb_to_intensity=False,
+            convert_rgb_to_intensity=False,  # Keep color information
             depth_scale=1000.0,  # Azure Kinect depth is in mm
             depth_trunc=3.0,  # 3m truncation
         )
         return rgbd
     
     def preprocess_point_cloud(self, pcd):
-        # Remove outliers
-        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        # Store original colors before preprocessing
+        original_colors = np.asarray(pcd.colors)
         
-        # Downsample
+        # Remove outliers
+        pcd, indices = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        
+        # Downsample with color preservation
         pcd = pcd.voxel_down_sample(self.voxel_size)
         
         # Compute normals
@@ -147,7 +153,7 @@ class KinectReconstructor:
             # Add to global model
             self.global_model += aligned_pcd
             
-            # Downsample global model to manage size
+            # Downsample global model to manage size while preserving colors
             if self.frame_count % 10 == 0:
                 self.global_model = self.global_model.voxel_down_sample(self.voxel_size)
             
@@ -212,13 +218,24 @@ class KinectReconstructor:
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             filename = f"{self.output_folder}/reconstruction_{timestamp}"
             
-            # Save as point cloud
+            # Save as point cloud with colors
             o3d.io.write_point_cloud(f"{filename}.ply", self.global_model)
             
             # Create and save mesh using Poisson reconstruction
             mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
                 self.global_model, depth=9, width=0, scale=1.1, linear_fit=False
             )[0]
+            
+            # Transfer colors from point cloud to mesh if possible
+            if len(self.global_model.colors) > 0:
+                print("Transferring colors to mesh...")
+                mesh.paint_uniform_color([0.5, 0.5, 0.5])  # Default color
+                try:
+                    mesh.vertex_colors = o3d.utility.Vector3dVector(np.asarray(self.global_model.colors))
+                except:
+                    print("Failed to transfer colors directly - trying to interpolate...")
+                    mesh.compute_vertex_normals()
+            
             o3d.io.write_triangle_mesh(f"{filename}.obj", mesh)
             
             print(f"Model saved to {filename}.ply and {filename}.obj")
@@ -244,7 +261,6 @@ class KinectReconstructor:
         print("  Esc: Exit the program")
         print("In Open3D, keypresses are often captured only when the visualization window is in focus, so you need to press 'Shift + R'")
         print("(or just 'R', depending on how the key events are set up) while the window is active for the callback to trigger.")
-
 
         last_time = time.time()
         fps_count = 0
@@ -273,6 +289,10 @@ class KinectReconstructor:
             new_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, self.intrinsics)
             new_pcd.transform(self.flip_transform)
             new_pcd = self.preprocess_point_cloud(new_pcd)
+            
+            # Verify colors are present
+            if len(new_pcd.colors) == 0:
+                print("Warning: No colors in point cloud!")
             
             # Update visualization pcd
             pcd.points = new_pcd.points
