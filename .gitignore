@@ -1,0 +1,15 @@
+# Ignore all images and visualizations
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.pdf
+*.ply
+*.obj
+# Ignore virtual environment
+.venv/
+
+# Ignore all reconstruction outputs
+azure-kinect-DK/Reconstruction/reconstruction_output/
+azure-kinect-DK/Reconstruction/captures/
