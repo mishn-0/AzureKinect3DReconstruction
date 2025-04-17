@@ -1,0 +1,197 @@
+import numpy as np
+import open3d as o3d
+from pyk4a import PyK4A, Config, ColorResolution, DepthMode
+import cv2
+import time
+import os
+import copy
+
+class KinectReconstructor:
+    def __init__(self):
+        self.cuda_available = False
+        try:
+            import cupy as cp
+            self.cuda_available = cp.cuda.runtime.getDeviceCount() > 0
+            self.cp = cp
+            if self.cuda_available:
+                print(f"[INFO] CUDA acceleration enabled - Device: {cp.cuda.runtime.getDeviceProperties(0)['name']}")
+            else:
+                print("[INFO] No CUDA device found, falling back to CPU")
+        except ImportError:
+            print("[INFO] CuPy not installed, running in CPU-only mode")
+        except Exception as e:
+            print(f"[WARNING] CUDA initialization failed: {e}")
+
+        self.k4a = PyK4A(Config(
+            color_resolution=ColorResolution.RES_720P,
+            depth_mode=DepthMode.NFOV_UNBINNED,
+            synchronized_images_only=True,
+        ))
+        self.k4a.start()
+
+        self.intrinsics = o3d.camera.PinholeCameraIntrinsic(
+            width=1280, height=720,
+            fx=605.286, fy=605.699,
+            cx=637.134, cy=366.758
+        )
+
+        self.flip_transform = np.array([
+            [1,  0,  0, 0],
+            [0, -1,  0, 0],
+            [0,  0, -1, 0],
+            [0,  0,  0, 1]
+        ])
+
+        self.voxel_size = 0.01
+        self.sdf_trunc = 0.04
+        self.block_resolution = 16
+        self.block_count = 1000
+
+        self.distance_threshold = 0.05
+        self.icp_distance_threshold = 0.03
+        self.keyframe_interval = 5
+
+        self.frame_count = 0
+        self.is_recording = False
+        self.output_folder = "reconstruction_output"
+        os.makedirs(self.output_folder, exist_ok=True)
+        self.vis = None
+
+        self.volume = None
+        self.trajectory = []
+        self.current_transformation = np.identity(4)
+        self.mesh_reconstruction = True
+
+        self.vis_pcd = o3d.geometry.PointCloud()
+        self.prev_rgbd = None
+        self.prev_color = None
+        self.prev_depth = None
+
+        self.integrated_mesh = None
+        self.integrated_pcd = None
+        self.show_integrated_model = True
+        self.vis_update_interval = 5
+        self.visualization_mode = "pointcloud"
+
+        try:
+            self.o3d_cuda_available = (hasattr(o3d, 'core') and 
+                                      hasattr(o3d.core, 'cuda') and 
+                                      o3d.core.cuda.is_available())
+            if self.o3d_cuda_available:
+                print("[INFO] Open3D CUDA acceleration enabled")
+                self.device = o3d.core.Device("CUDA:0")
+            else:
+                print("[INFO] Open3D CUDA not available")
+                self.device = o3d.core.Device("CPU:0")
+        except Exception as e:
+            print(f"[WARNING] Open3D CUDA check failed: {e}")
+            self.o3d_cuda_available = False
+            self.device = None
+
+    def initialize_volume(self):
+        if not self.mesh_reconstruction:
+            return
+
+        if hasattr(o3d, 'pipelines') and hasattr(o3d.pipelines, 'integration'):
+            try:
+                self.volume = o3d.pipelines.integration.ScalableTSDFVolume(
+                    voxel_length=self.voxel_size,
+                    sdf_trunc=self.sdf_trunc,
+                    color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+                )
+                print("[INFO] Using legacy ScalableTSDFVolume")
+            except Exception as e:
+                print(f"[WARNING] Failed to initialize ScalableTSDFVolume: {e}")
+                self.mesh_reconstruction = False
+        else:
+            print("[WARNING] o3d.pipelines.integration not available")
+            self.mesh_reconstruction = False
+
+    def process_images(self, color_img, depth_img):
+        color_img = cv2.cvtColor(cv2.flip(color_img, -1), cv2.COLOR_BGR2RGB)
+        depth_img = cv2.flip(depth_img, -1)
+
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(color_img),
+            o3d.geometry.Image(depth_img),
+            convert_rgb_to_intensity=False,
+            depth_scale=1000.0,
+            depth_trunc=3.0,
+        )
+
+        return rgbd, color_img, depth_img
+
+    def add_rgbd_to_volume(self, rgbd, transformation):
+        if self.volume is not None:
+            self.volume.integrate(rgbd, self.intrinsics, transformation)
+
+    def toggle_record(self, vis):
+        self.is_recording = not self.is_recording
+        print("[INFO] Recording:" if self.is_recording else "[INFO] Paused")
+
+    def save_model(self, vis):
+        if self.volume is None:
+            print("[WARNING] No volume to save")
+            return
+        mesh = self.volume.extract_triangle_mesh()
+        mesh.compute_vertex_normals()
+        o3d.io.write_triangle_mesh(os.path.join(self.output_folder, "mesh.ply"), mesh)
+        print("[INFO] Mesh saved to output folder")
+
+    def toggle_model_mode(self, vis):
+        self.visualization_mode = "mesh" if self.visualization_mode == "pointcloud" else "pointcloud"
+        print(f"[INFO] Visualization mode: {self.visualization_mode}")
+
+    def quit_app(self, vis):
+        print("[INFO] Quitting...")
+        self.k4a.stop()
+        vis.destroy_window()
+
+    def run(self):
+        print("[INFO] Starting reconstruction loop...")
+        self.initialize_volume()
+
+        self.vis = o3d.visualization.VisualizerWithKeyCallback()
+        self.vis.create_window("Kinect 3D Reconstruction", width=1280, height=720)
+        self.vis.add_geometry(self.vis_pcd)
+
+        self.vis.register_key_callback(ord("R"), self.toggle_record)
+        self.vis.register_key_callback(ord("S"), self.save_model)
+        self.vis.register_key_callback(ord("M"), self.toggle_model_mode)
+        self.vis.register_key_callback(ord("Q"), self.quit_app)
+
+        try:
+            while True:
+                capture = self.k4a.get_capture()
+                if capture.color is None or capture.depth is None:
+                    continue
+
+                rgbd, color, depth = self.process_images(capture.color, capture.depth)
+
+                if self.is_recording:
+                    print(f"[INFO] Recording frame {self.frame_count}")
+                    self.add_rgbd_to_volume(rgbd, self.current_transformation)
+
+                temp_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
+                    rgbd, self.intrinsics
+                )
+                temp_pcd.transform(self.flip_transform)
+
+                self.vis_pcd.clear()
+                self.vis_pcd.points = temp_pcd.points
+                self.vis_pcd.colors = temp_pcd.colors
+
+                self.vis.update_geometry(self.vis_pcd)
+                self.vis.poll_events()
+                self.vis.update_renderer()
+
+                self.frame_count += 1
+
+        except KeyboardInterrupt:
+            print("[INFO] Stopped by user")
+            self.vis.destroy_window()
+            self.k4a.stop()
+
+if __name__ == '__main__':
+    reconstructor = KinectReconstructor()
+    reconstructor.run()

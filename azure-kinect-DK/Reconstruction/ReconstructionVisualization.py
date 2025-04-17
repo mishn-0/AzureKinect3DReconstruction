@@ -218,13 +218,6 @@ class KinectReconstructor:
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             filename = f"{self.output_folder}/reconstruction_{timestamp}"
             
-            # Ensure that the normals are estimated before Poisson reconstruction
-            if len(self.global_model.normals) == 0:
-                print("Warning: No normals in point cloud. Estimating normals...")
-                self.global_model.estimate_normals(
-                    search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
-                )
-            
             # Save as point cloud with colors
             o3d.io.write_point_cloud(f"{filename}.ply", self.global_model)
             
@@ -321,8 +314,7 @@ class KinectReconstructor:
     
     def cleanup(self):
         self.k4a.stop()
-        self.vis.destroy_window()
-
+        print("Kinect stopped and program finished.")
 
 if __name__ == "__main__":
     reconstructor = KinectReconstructor()
