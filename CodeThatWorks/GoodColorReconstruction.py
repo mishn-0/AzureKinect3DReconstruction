@@ -473,25 +473,12 @@ class KinectReconstructor:
             if self.integrated_mesh is not None and self.integrated_mesh in vis.get_geometry_list():
                 vis.remove_geometry(self.integrated_mesh, False)
             
-            # Get current frame to show immediately
-            capture = self.k4a.get_capture()
-            if capture.color is not None and capture.transformed_depth is not None:
-                curr_rgbd, _, _ = self.process_images(capture.color, capture.transformed_depth)
-                curr_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(curr_rgbd, self.intrinsics)
-                curr_pcd.transform(self.flip_transform)
-                
-                # Create new point cloud for visualization
-                self.vis_pcd = o3d.geometry.PointCloud()
-                self.vis_pcd.points = curr_pcd.points
-                self.vis_pcd.colors = curr_pcd.colors
-            
             # Add current frame point cloud
             if self.vis_pcd is not None:
                 vis.add_geometry(self.vis_pcd)
+                vis.update_geometry(self.vis_pcd)
                 print("[INFO] Showing current frame")
         
-        vis.poll_events()
-        vis.update_renderer()
         return True
 
     def reset_model(self, vis):
@@ -527,7 +514,6 @@ class KinectReconstructor:
                     self.prev_rgbd, self.intrinsics)
                 initial_pcd.transform(self.flip_transform)
                 
-                self.vis_pcd = o3d.geometry.PointCloud()
                 self.vis_pcd.points = initial_pcd.points
                 self.vis_pcd.colors = initial_pcd.colors
                 
@@ -600,17 +586,9 @@ class KinectReconstructor:
         registration_times = []
         
         while True:
-            # Poll events for interactive response
-            self.vis.poll_events()
-            
-            # Check if window is closed
-            if not self.vis.poll_events():
-                break
-                
             # Get new frame
             capture = self.k4a.get_capture()
             if capture.color is None or capture.transformed_depth is None:
-                self.vis.update_renderer()  # Still update renderer even if no new frame
                 continue
 
             # Process images
@@ -624,15 +602,12 @@ class KinectReconstructor:
             
             # Update visualization point cloud for current frame view
             if not self.show_integrated_model:
-                # Remove old point cloud and create a new one for better performance
-                if self.vis_pcd in self.vis.get_geometry_list():
-                    self.vis.remove_geometry(self.vis_pcd, False)
-                
-                # Create new point cloud for visualization
-                self.vis_pcd = o3d.geometry.PointCloud()
                 self.vis_pcd.points = curr_pcd.points
                 self.vis_pcd.colors = curr_pcd.colors
-                self.vis.add_geometry(self.vis_pcd)
+                if self.vis_pcd in self.vis.get_geometry_list():
+                    self.vis.update_geometry(self.vis_pcd)
+                else:
+                    self.vis.add_geometry(self.vis_pcd)
             
             # If recording is on, process for reconstruction
             if self.is_recording:
@@ -704,53 +679,18 @@ class KinectReconstructor:
                 fps_count = 0
                 last_time = time.time()
                 registration_times = []
-                
-            # Update renderer
-            self.vis.update_renderer()
             
-            # Check for exit request
-            if not self.vis.poll_events():
-                break
+            # Update visualization
+            self.vis.poll_events()
+            self.vis.update_renderer()
 
     def cleanup(self):
         """Clean up resources"""
-        print("[INFO] Cleaning up resources...")
         try:
-            # Save model on exit if we have data
-            if self.frame_count > 0 and len(self.trajectory) > 1:
-                self.save_model(self.vis)
-                
-            # Stop Kinect
             self.k4a.stop()
-            
-            # Close visualization window
-            if self.vis is not None:
-                self.vis.destroy_window()
-                
-            print("[INFO] Cleanup complete.")
-        except Exception as e:
-            print(f"[ERROR] Cleanup failed: {e}")
-
-def main():
-    """Main function"""
-    try:
-        print("*" * 80)
-        print("Kinect 3D Reconstruction")
-        print("*" * 80)
-        print("\nInitializing system...")
-        
-        # Create and start reconstruction
-        reconstructor = KinectReconstructor()
-        reconstructor.start_visualization()
-        
-    except KeyboardInterrupt:
-        print("\n[INFO] Program interrupted by user")
-    except Exception as e:
-        print(f"[ERROR] An unexpected error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        print("[INFO] Program terminated")
+        except:
+            pass
+        print("[INFO] Kinect stopped. Program terminated.")
 
 if __name__ == "__main__":
-    main()
+    KinectReconstructor().start_visualization()

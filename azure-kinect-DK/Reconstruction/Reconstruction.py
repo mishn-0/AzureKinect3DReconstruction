@@ -153,9 +153,19 @@ class KinectReconstructor:
             # Add to global model
             self.global_model += aligned_pcd
             
-            # Downsample global model to manage size while preserving colors
+            # Downsample global model to manage size while preserving colors and normals
             if self.frame_count % 10 == 0:
+                # Store original colors and normals
+                original_colors = np.asarray(self.global_model.colors)
+                original_normals = np.asarray(self.global_model.normals)
+                
+                # Downsample
                 self.global_model = self.global_model.voxel_down_sample(self.voxel_size)
+                
+                # Recompute normals after downsampling
+                self.global_model.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+                )
             
             # Update previous frame
             self.previous_pcd = copy.deepcopy(new_pcd)
@@ -215,6 +225,10 @@ class KinectReconstructor:
             return True
         
         def save_model(vis):
+            if len(self.global_model.points) == 0:
+                print("Error: No points in the global model. Cannot save empty point cloud.")
+                return False
+            
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             filename = f"{self.output_folder}/reconstruction_{timestamp}"
             
@@ -229,23 +243,27 @@ class KinectReconstructor:
             o3d.io.write_point_cloud(f"{filename}.ply", self.global_model)
             
             # Create and save mesh using Poisson reconstruction
-            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                self.global_model, depth=9, width=0, scale=1.1, linear_fit=False
-            )[0]
+            try:
+                mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                    self.global_model, depth=9, width=0, scale=1.1, linear_fit=False
+                )[0]
+                
+                # Transfer colors from point cloud to mesh if possible
+                if len(self.global_model.colors) > 0:
+                    print("Transferring colors to mesh...")
+                    mesh.paint_uniform_color([0.5, 0.5, 0.5])  # Default color
+                    try:
+                        mesh.vertex_colors = o3d.utility.Vector3dVector(np.asarray(self.global_model.colors))
+                    except:
+                        print("Failed to transfer colors directly - trying to interpolate...")
+                        mesh.compute_vertex_normals()
+                
+                o3d.io.write_triangle_mesh(f"{filename}.obj", mesh)
+                print(f"Model saved to {filename}.ply and {filename}.obj")
+            except Exception as e:
+                print(f"Error during mesh creation: {e}")
+                print("Only point cloud was saved.")
             
-            # Transfer colors from point cloud to mesh if possible
-            if len(self.global_model.colors) > 0:
-                print("Transferring colors to mesh...")
-                mesh.paint_uniform_color([0.5, 0.5, 0.5])  # Default color
-                try:
-                    mesh.vertex_colors = o3d.utility.Vector3dVector(np.asarray(self.global_model.colors))
-                except:
-                    print("Failed to transfer colors directly - trying to interpolate...")
-                    mesh.compute_vertex_normals()
-            
-            o3d.io.write_triangle_mesh(f"{filename}.obj", mesh)
-            
-            print(f"Model saved to {filename}.ply and {filename}.obj")
             return True
         
         def reset_model(vis):
@@ -307,7 +325,7 @@ class KinectReconstructor:
             pcd.normals = new_pcd.normals
             
             # Add to reconstruction model if recording
-            if self.is_recording and self.frame_count % self.keyframe_interval == 2:  # Process every 5th frame
+            if self.is_recording and self.frame_count % self.keyframe_interval == 0:  # Process every 5th frame
                 success = self.add_frame_to_model(copy.deepcopy(new_pcd))
                 if success:
                     print(f"Added frame {self.frame_count} to model, total points: {len(self.global_model.points)}")

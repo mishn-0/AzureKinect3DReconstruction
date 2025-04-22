@@ -15,42 +15,14 @@ class KinectReconstructor:
             self.cuda_available = cp.cuda.runtime.getDeviceCount() > 0
             self.cp = cp
             if self.cuda_available:
-                print(f"[INFO] CuPy CUDA acceleration enabled - Device: {cp.cuda.runtime.getDeviceProperties(0)['name']}")
+                print(f"[INFO] CUDA acceleration enabled - Device: {cp.cuda.runtime.getDeviceProperties(0)['name']}")
             else:
-                print("[INFO] No CuPy CUDA device found")
+                print("[INFO] No CUDA device found, falling back to CPU")
         except ImportError:
-            print("[INFO] CuPy not installed")
+            print("[INFO] CuPy not installed, running in CPU-only mode")
         except Exception as e:
-            print(f"[WARNING] CuPy CUDA initialization failed: {e}")
+            print(f"[WARNING] CUDA initialization failed: {e}")
         
-        # Check Open3D CUDA
-        try:
-            import open3d as o3d
-            self.o3d_cuda_available = False
-            self.device = o3d.core.Device("CPU:0")
-            
-            # Try to create a CUDA device
-            try:
-                cuda_device = o3d.core.Device("CUDA:0")
-                # Test CUDA functionality with a simple operation
-                test_tensor = o3d.core.Tensor([1, 2, 3], device=cuda_device)
-                if test_tensor.is_cuda:
-                    self.o3d_cuda_available = True
-                    self.device = cuda_device
-                    print("[INFO] Open3D CUDA acceleration enabled")
-                else:
-                    print("[INFO] Open3D CUDA device created but not functional")
-            except Exception as e:
-                print(f"[INFO] Open3D CUDA not available: {e}")
-                print("[INFO] To enable CUDA acceleration, ensure you have:")
-                print("  1. CUDA toolkit installed")
-                print("  2. Open3D installed with CUDA support")
-                print("  3. Compatible NVIDIA GPU with drivers")
-        except Exception as e:
-            print(f"[WARNING] Open3D CUDA check failed: {e}")
-            self.o3d_cuda_available = False
-            self.device = o3d.core.Device("CPU:0")
-
         self.k4a = PyK4A(Config(
             color_resolution=ColorResolution.RES_720P,
             depth_mode=DepthMode.NFOV_UNBINNED,
@@ -73,20 +45,16 @@ class KinectReconstructor:
             [0,  0,  0, 1]
         ])
 
-        # Visualization parameters
-        self.vis_voxel_size = 0.02  # Larger voxel size for visualization
-        self.recon_voxel_size = 0.01  # Smaller voxel size for reconstruction
-        
-        # Update reconstruction parameters
-        self.voxel_size = self.recon_voxel_size  # Use smaller voxel size for reconstruction
-        self.sdf_trunc = 0.04
-        self.block_resolution = 16
-        self.block_count = 1000
+        # IMPORTANT: Parameters for reconstruction
+        self.voxel_size = 0.01  # Downsampling size
+        self.sdf_trunc = 0.04  # Truncation value for signed distance function, TSDF distance truncation for smoothing
+        self.block_resolution = 16  # Resolution of the TSDF volume block
+        self.block_count = 1000  # Initial number of blocks     #Used for GPU-based TSDF
         
         # Registration parameters
         self.distance_threshold = 0.05  # For initial registration and alignment
         self.icp_distance_threshold = 0.03  # For ICP refinement
-        self.keyframe_interval = 5  # Process every nth frame for registration
+        self.keyframe_interval = 10  # Process every nth frame
 
         # Setup visualization and model
         self.frame_count = 0        # Track how many frames we have processed so far, initialized at 0, first frame triggers events
@@ -108,7 +76,6 @@ class KinectReconstructor:
         self.prev_rgbd = None
         self.prev_color = None
         self.prev_depth = None
-        self.prev_pcd = None
         
         # For visualizing the integrated model
         self.integrated_mesh = None
@@ -117,8 +84,21 @@ class KinectReconstructor:
         self.vis_update_interval = 5  # Update visualization every n frames (reduced for better feedback)
         self.visualization_mode = "pointcloud"  # "pointcloud" or "mesh"
 
-        # Initialize TSDF volume
-        self.initialize_volume()
+        # Check Open3D CUDA
+        try:
+            self.o3d_cuda_available = (hasattr(o3d, 'core') and 
+                                      hasattr(o3d.core, 'cuda') and 
+                                      o3d.core.cuda.is_available())
+            if self.o3d_cuda_available:
+                print("[INFO] Open3D CUDA acceleration enabled")
+                self.device = o3d.core.Device("CUDA:0")
+            else:
+                print("[INFO] Open3D CUDA not available")
+                self.device = o3d.core.Device("CPU:0")
+        except Exception as e:
+            print(f"[WARNING] Open3D CUDA check failed: {e}")
+            self.o3d_cuda_available = False
+            self.device = None
 
     def initialize_volume(self):
         """Initialize TSDF volume for reconstruction"""
@@ -127,26 +107,15 @@ class KinectReconstructor:
             
         if hasattr(o3d, 'pipelines') and hasattr(o3d.pipelines, 'integration'):
             try:
-                if self.o3d_cuda_available:
-                    # Use CUDA-accelerated TSDF volume
-                    self.volume = o3d.pipelines.integration.ScalableTSDFVolume(
-                        voxel_length=self.voxel_size,
-                        sdf_trunc=self.sdf_trunc,
-                        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
-                        device=self.device
-                    )
-                    print("[INFO] Using CUDA-accelerated ScalableTSDFVolume")
-                else:
-                    # Fall back to CPU version
-                    self.volume = o3d.pipelines.integration.ScalableTSDFVolume(
-                        voxel_length=self.voxel_size,
-                        sdf_trunc=self.sdf_trunc,
-                        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
-                    )
-                    print("[INFO] Using CPU ScalableTSDFVolume")
+                # Legacy ScalableTSDFVolume
+                self.volume = o3d.pipelines.integration.ScalableTSDFVolume(
+                    voxel_length=self.voxel_size,
+                    sdf_trunc=self.sdf_trunc,
+                    color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+                )
+                print("[INFO] Using legacy ScalableTSDFVolume")
             except Exception as e:
-                print(f"[WARNING] Failed to initialize TSDFVolume: {e}")
-                print("[INFO] If you want CUDA acceleration, ensure Open3D was built with CUDA support")
+                print(f"[WARNING] Failed to initialize ScalableTSDFVolume: {e}")
                 self.mesh_reconstruction = False
         else:
             print("[WARNING] o3d.pipelines.integration not available")
@@ -154,81 +123,34 @@ class KinectReconstructor:
 
     def process_images(self, color_img, depth_img):
         """Process color and depth images"""
-        try:
-            # For stable color processing, use CPU
-            color_img = cv2.cvtColor(cv2.flip(color_img, -1), cv2.COLOR_BGR2RGB)
-            depth_img = cv2.flip(depth_img, -1)
+        # For stable color processing, use CPU
+        color_img = cv2.cvtColor(cv2.flip(color_img, -1), cv2.COLOR_BGR2RGB)
+        depth_img = cv2.flip(depth_img, -1)
 
-            # Create RGBD image
-            if self.o3d_cuda_available:
-                # Convert to CUDA tensors
-                color_tensor = o3d.core.Tensor(color_img, device=self.device)
-                depth_tensor = o3d.core.Tensor(depth_img, device=self.device)
-                
-                # Create RGBD image on CUDA
-                rgbd = o3d.t.geometry.RGBDImage.create_from_color_and_depth(
-                    color_tensor,
-                    depth_tensor,
-                    depth_scale=1000.0,
-                    depth_trunc=3.0,
-                    convert_rgb_to_intensity=False
-                )
-                
-                # Convert to legacy format for compatibility
-                legacy_rgbd = rgbd.to_legacy()
-                return legacy_rgbd, color_img, depth_img
-            else:
-                rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                    o3d.geometry.Image(color_img),
-                    o3d.geometry.Image(depth_img),
-                    convert_rgb_to_intensity=False,
-                    depth_scale=1000.0,
-                    depth_trunc=3.0,
-                )
-                return rgbd, color_img, depth_img
-        except Exception as e:
-            print(f"[ERROR] Failed to process images: {e}")
-            return None, None, None
-
-    def get_next_frame(self):
-        """Safely get the next frame from Kinect"""
-        try:
-            capture = self.k4a.get_capture()
-            if capture is None or capture.color is None or capture.transformed_depth is None:
-                return None, None
-            return capture.color, capture.transformed_depth
-        except Exception as e:
-            print(f"[ERROR] Failed to get frame: {e}")
-            return None, None
+        # Create RGBD image
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(color_img),
+            o3d.geometry.Image(depth_img),
+            convert_rgb_to_intensity=False,
+            depth_scale=1000.0,
+            depth_trunc=3.0,
+        )
+        
+        return rgbd, color_img, depth_img
 
     def preprocess_point_cloud(self, pcd):
         """Process point cloud for registration"""
-        try:
-            # Remove outliers
-            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-            
-            # Downsample
-            if self.o3d_cuda_available:
-                # Convert to CUDA point cloud for processing
-                pcd_cuda = o3d.t.geometry.PointCloud.from_legacy(pcd)
-                pcd_cuda = pcd_cuda.voxel_down_sample(self.voxel_size)
-                pcd = pcd_cuda.to_legacy()
-            else:
-                pcd = pcd.voxel_down_sample(self.voxel_size)
-            
-            # Estimate normals
-            if self.o3d_cuda_available:
-                pcd_cuda = o3d.t.geometry.PointCloud.from_legacy(pcd)
-                pcd_cuda.estimate_normals()
-                pcd = pcd_cuda.to_legacy()
-            else:
-                pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-                pcd.orient_normals_towards_camera_location(np.array([0, 0, 0]))
-            
-            return pcd
-        except Exception as e:
-            print(f"[ERROR] Failed to preprocess point cloud: {e}")
-            return pcd
+        # Remove outliers
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        
+        # Downsample
+        pcd = pcd.voxel_down_sample(self.voxel_size)
+        
+        # Estimate normals
+        pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+        pcd.orient_normals_towards_camera_location(np.array([0, 0, 0]))
+        
+        return pcd
 
     def compute_features(self, pcd):
         """Compute FPFH features for registration"""
@@ -283,41 +205,17 @@ class KinectReconstructor:
 
     def register_frames(self, source_pcd, target_pcd):
         """Register source to target point cloud"""
-        try:
-            if self.o3d_cuda_available:
-                # Convert to CUDA point clouds
-                source_cuda = o3d.t.geometry.PointCloud.from_legacy(source_pcd)
-                target_cuda = o3d.t.geometry.PointCloud.from_legacy(target_pcd)
-                
-                # Perform registration on CUDA
-                result = o3d.pipelines.registration.registration_icp(
-                    source_cuda, target_cuda, 
-                    self.icp_distance_threshold,
-                    o3d.core.Tensor(np.identity(4), device=self.device),
-                    o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100)
-                )
-                
-                if result.fitness < 0.5:
-                    print(f"[WARNING] Low ICP fitness: {result.fitness:.3f}")
-                    return None
-                    
-                return result.transformation.cpu().numpy()
-            else:
-                # First try standard registration pipeline
-                global_transform = self.global_registration(source_pcd, target_pcd)
-                if global_transform is None:
-                    return None
-                    
-                # Refine with ICP
-                transform = self.icp_registration(source_pcd, target_pcd, global_transform)
-                if transform is None:
-                    return None
-                    
-                return transform
-        except Exception as e:
-            print(f"[ERROR] Failed to register frames: {e}")
+        # First try standard registration pipeline
+        global_transform = self.global_registration(source_pcd, target_pcd)
+        if global_transform is None:
             return None
+            
+        # Refine with ICP
+        transform = self.icp_registration(source_pcd, target_pcd, global_transform)
+        if transform is None:
+            return None
+            
+        return transform
 
     def register_rgbd(self, source_rgbd, target_rgbd, source_pcd=None, target_pcd=None):
         """Register two RGBD frames using colored ICP"""
@@ -369,22 +267,9 @@ class KinectReconstructor:
             return
             
         try:
-            if self.o3d_cuda_available:
-                # Convert transform to CUDA tensor if using CUDA
-                transform_tensor = o3d.core.Tensor(transform, device=self.device)
-                self.volume.integrate(rgbd, self.intrinsics, transform_tensor)
-            else:
-                self.volume.integrate(rgbd, self.intrinsics, np.linalg.inv(transform))
+            self.volume.integrate(rgbd, self.intrinsics, np.linalg.inv(transform))
         except Exception as e:
             print(f"[WARNING] Failed to integrate frame into volume: {e}")
-
-    def downsample_point_cloud(self, pcd, voxel_size):
-        """Downsample a point cloud using voxel grid"""
-        try:
-            return pcd.voxel_down_sample(voxel_size)
-        except Exception as e:
-            print(f"[ERROR] Failed to downsample point cloud: {e}")
-            return pcd
 
     def update_visualization_model(self):
         """Update the visualization model from the TSDF volume"""
@@ -400,9 +285,14 @@ class KinectReconstructor:
                 new_mesh = self.volume.extract_triangle_mesh()
                 new_mesh.compute_vertex_normals()
                 
-                # Remove old mesh if it exists
-                if self.integrated_mesh is not None:
+                # Check if we already have a mesh in the visualizer
+                if self.integrated_mesh is not None and self.integrated_mesh in self.vis.get_geometry_list():
+                    # Remove old mesh
                     self.vis.remove_geometry(self.integrated_mesh, False)
+                
+                # If point cloud exists, remove it
+                if self.integrated_pcd is not None and self.integrated_pcd in self.vis.get_geometry_list():
+                    self.vis.remove_geometry(self.integrated_pcd, False)
                 
                 # Update mesh reference
                 self.integrated_mesh = new_mesh
@@ -414,12 +304,14 @@ class KinectReconstructor:
                 # Extract point cloud for visualization
                 new_pcd = self.volume.extract_point_cloud()
                 
-                # Downsample for visualization
-                new_pcd = self.downsample_point_cloud(new_pcd, self.vis_voxel_size)
-                
-                # Remove old point cloud if it exists
-                if self.integrated_pcd is not None:
+                # Check if we already have a point cloud in the visualizer
+                if self.integrated_pcd is not None and self.integrated_pcd in self.vis.get_geometry_list():
+                    # Remove old point cloud
                     self.vis.remove_geometry(self.integrated_pcd, False)
+                
+                # If mesh exists, remove it
+                if self.integrated_mesh is not None and self.integrated_mesh in self.vis.get_geometry_list():
+                    self.vis.remove_geometry(self.integrated_mesh, False)
                 
                 # Update point cloud reference
                 self.integrated_pcd = new_pcd
@@ -434,6 +326,8 @@ class KinectReconstructor:
             return True
         except Exception as e:
             print(f"[ERROR] Failed to update visualization model: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def start_visualization(self):
@@ -462,14 +356,15 @@ class KinectReconstructor:
             first_rgbd, self.intrinsics)
         initial_pcd.transform(self.flip_transform)
         
-        # Create visualization point cloud
+        # Save initial visualization point cloud
         self.vis_pcd = o3d.geometry.PointCloud()
         self.vis_pcd.points = initial_pcd.points
         self.vis_pcd.colors = initial_pcd.colors
         
-        # Add to visualization
-        self.vis.add_geometry(self.vis_pcd)
-        print("[INFO] Added initial frame to visualization")
+        # Add to visualization based on mode
+        if not self.show_integrated_model:
+            self.vis.add_geometry(self.vis_pcd)
+            print("[INFO] Added initial frame to visualization")
         
         # Store first frame
         self.prev_rgbd = first_rgbd
@@ -508,31 +403,21 @@ class KinectReconstructor:
         self.vis.register_key_callback(ord("R"), self.toggle_recording)
         self.vis.register_key_callback(ord("S"), self.save_model)
         self.vis.register_key_callback(ord("C"), self.reset_model)
+        self.vis.register_key_callback(ord("M"), self.toggle_mesh_reconstruction)
+        self.vis.register_key_callback(ord("V"), self.toggle_visualization_mode)
+        self.vis.register_key_callback(ord("I"), self.toggle_show_integrated)
+        self.vis.register_key_callback(ord("U"), self.force_update_visualization)
 
     def toggle_recording(self, vis):
         """Toggle recording on/off"""
-        try:
-            self.is_recording = not self.is_recording
-            if self.is_recording:
-                # Reset trajectory and transformation when starting recording
-                self.trajectory = [np.identity(4)]
-                self.current_transformation = np.identity(4)
-                self.frame_count = 0
-                # Reinitialize volume
-                self.initialize_volume()
-                # Clear any existing integrated model
-                if self.integrated_mesh is not None:
-                    vis.remove_geometry(self.integrated_mesh, False)
-                    self.integrated_mesh = None
-                if self.integrated_pcd is not None:
-                    vis.remove_geometry(self.integrated_pcd, False)
-                    self.integrated_pcd = None
-            print(f"[INFO] Recording {'started' if self.is_recording else 'stopped'}")
-            return True
-        except Exception as e:
-            print(f"[ERROR] Failed to toggle recording: {e}")
-            self.is_recording = False
-            return False
+        self.is_recording = not self.is_recording
+        print(f"[INFO] Recording {'started' if self.is_recording else 'stopped'}")
+        
+        # Force update visualization when starting recording
+        if self.is_recording and self.show_integrated_model:
+            self.update_visualization_model()
+        
+        return True
 
     def toggle_mesh_reconstruction(self, vis):
         """Toggle mesh reconstruction on/off"""
@@ -686,147 +571,126 @@ class KinectReconstructor:
         print("  R: Toggle recording")
         print("  S: Save model")
         print("  C: Reset model")
+        print("  M: Toggle mesh reconstruction")
+        print("  V: Toggle visualization mode (mesh/point cloud)")
+        print("  I: Toggle between integrated model and current frame")
+        print("  U: Force update visualization")
         print("  Esc: Exit\n")
 
         last_time = time.time()
         fps_count = 0
         success_count = 0
-        last_update = 0
-        update_interval = 5  # Update visualization every 5 frames
+        update_vis_count = 0
         
-        try:
-            while True:
-                # Get new frame
-                color_img, depth_img = self.get_next_frame()
-                if color_img is None or depth_img is None:
-                    continue
+        # For measuring registration quality
+        registration_times = []
+        
+        while True:
+            # Get new frame
+            capture = self.k4a.get_capture()
+            if capture.color is None or capture.transformed_depth is None:
+                continue
 
-                try:
-                    # Process images
-                    curr_rgbd, curr_color, curr_depth = self.process_images(color_img, depth_img)
-                    if curr_rgbd is None:
-                        continue
-
-                    # Create point cloud for current frame visualization
-                    if self.o3d_cuda_available:
-                        # Use CUDA for point cloud creation
-                        rgbd_tensor = o3d.t.geometry.RGBDImage.from_legacy(curr_rgbd)
-                        intrinsics_tensor = o3d.core.Tensor(self.intrinsics.intrinsic_matrix, device=self.device)
-                        curr_pcd = o3d.t.geometry.PointCloud.create_from_rgbd_image(
-                            rgbd_tensor,
-                            intrinsics_tensor
-                        )
-                        curr_pcd = curr_pcd.to_legacy()
-                    else:
-                        curr_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
-                            curr_rgbd, self.intrinsics)
-                    
-                    curr_pcd.transform(self.flip_transform)
-                    
-                    # Downsample for visualization
-                    curr_pcd = self.downsample_point_cloud(curr_pcd, self.vis_voxel_size)
-                    
-                    # Update visualization point cloud
-                    self.vis_pcd.points = curr_pcd.points
-                    self.vis_pcd.colors = curr_pcd.colors
-                    
-                    # Update geometry
+            # Process images
+            curr_rgbd, curr_color, curr_depth = self.process_images(
+                capture.color, capture.transformed_depth)
+            
+            # Create point cloud for current frame visualization
+            curr_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
+                curr_rgbd, self.intrinsics)
+            curr_pcd.transform(self.flip_transform)
+            
+            # Update visualization point cloud for current frame view
+            if not self.show_integrated_model:
+                self.vis_pcd.points = curr_pcd.points
+                self.vis_pcd.colors = curr_pcd.colors
+                if self.vis_pcd in self.vis.get_geometry_list():
                     self.vis.update_geometry(self.vis_pcd)
-                    
-                    # If recording is on, process for reconstruction
-                    if self.is_recording:
-                        try:
-                            # If we have a previous frame, register against it
-                            if self.prev_rgbd is not None and self.prev_pcd is not None:
-                                # Preprocess point clouds
-                                source_pcd = self.preprocess_point_cloud(copy.deepcopy(curr_pcd))
-                                target_pcd = self.preprocess_point_cloud(copy.deepcopy(self.prev_pcd))
-                                
-                                # Compute transformation between frames
-                                transform = self.register_frames(source_pcd, target_pcd)
-                                
-                                if transform is not None:
-                                    # Update global transformation
-                                    self.current_transformation = np.matmul(
-                                        self.current_transformation, transform)
-                                    
-                                    # Save to trajectory
-                                    self.trajectory.append(self.current_transformation.copy())
-                                    
-                                    # Success
-                                    success_count += 1
-                                    print(f"[+] Frame {self.frame_count} registered")
-                                    
-                                    # Add to TSDF volume with current transformation
-                                    if self.mesh_reconstruction and self.volume is not None:
-                                        try:
-                                            self.add_rgbd_to_volume(curr_rgbd, self.current_transformation)
-                                            
-                                            # Update visualization every few frames
-                                            if self.frame_count - last_update >= update_interval:
-                                                self.update_visualization_model()
-                                                last_update = self.frame_count
-                                                print(f"[INFO] Updated visualization at frame {self.frame_count}")
-                                        except Exception as e:
-                                            print(f"[ERROR] Failed to add frame to volume: {e}")
-                                else:
-                                    print(f"[!] Failed to register frame {self.frame_count}")
+                else:
+                    self.vis.add_geometry(self.vis_pcd)
+            
+            # If recording is on, process for reconstruction
+            if self.is_recording:
+                start_time = time.time()
+                
+                try:
+                    # If we have a previous frame, register against it
+                    if self.prev_rgbd is not None:
+                        # Process only certain frames for registration (but integrate all)
+                        if self.frame_count % self.keyframe_interval == 0:
+                            # Preprocess point clouds
+                            source_pcd = self.preprocess_point_cloud(copy.deepcopy(curr_pcd))
                             
-                            # Store current frame as previous
-                            self.prev_rgbd = curr_rgbd
-                            self.prev_color = curr_color
-                            self.prev_depth = curr_depth
-                            self.prev_pcd = curr_pcd
+                            # Compute transformation between frames
+                            transform = self.register_rgbd(
+                                curr_rgbd, self.prev_rgbd, source_pcd)
                             
-                        except Exception as e:
-                            print(f"[ERROR] Failed to process recording frame: {e}")
+                            if transform is not None:
+                                # Update global transformation
+                                self.current_transformation = np.matmul(
+                                    self.current_transformation, transform)
+                                
+                                # Save to trajectory
+                                self.trajectory.append(self.current_transformation.copy())
+                                
+                                # Success
+                                success_count += 1
+                                reg_time = time.time() - start_time
+                                registration_times.append(reg_time)
+                                
+                                print(f"[+] Frame {self.frame_count} registered in {reg_time:.2f}s")
+                            else:
+                                print(f"[!] Failed to register frame {self.frame_count}")
+                        
+                        # Always add to TSDF volume with current transformation
+                        if self.mesh_reconstruction and self.volume is not None:
+                            self.add_rgbd_to_volume(curr_rgbd, self.current_transformation)
+                            
+                            # Update visualization periodically
+                            update_vis_count += 1
+                            if self.show_integrated_model and update_vis_count >= self.vis_update_interval:
+                                self.update_visualization_model()
+                                update_vis_count = 0
+                                print(f"[INFO] Updated visualization at frame {self.frame_count}")
                     
-                    # Update counters
-                    self.frame_count += 1
-                    fps_count += 1
-                    
-                    # FPS calculation
-                    if time.time() - last_time > 1.0:
-                        mode = "TSDF" if self.mesh_reconstruction else "PCL"
-                        cuda_status = "CUDA" if self.o3d_cuda_available else "CPU"
-                        print(f"[FPS] {fps_count} | Mode: {mode} | " + 
-                              f"Recording: {'ON' if self.is_recording else 'OFF'} | " + 
-                              f"Success: {success_count}/{self.frame_count} | " +
-                              f"Acceleration: {cuda_status}")
-                        fps_count = 0
-                        last_time = time.time()
-                    
-                    # Update visualization less frequently
-                    if self.frame_count % 2 == 0:  # Only update every other frame
-                        self.vis.poll_events()
-                        self.vis.update_renderer()
+                    # Store current frame as previous
+                    self.prev_rgbd = curr_rgbd
+                    self.prev_color = curr_color
+                    self.prev_depth = curr_depth
                     
                 except Exception as e:
-                    print(f"[ERROR] Failed to process frame: {e}")
-                    continue
-                    
-        except KeyboardInterrupt:
-            print("\n[INFO] Keyboard interrupt received, cleaning up...")
-        finally:
-            self.cleanup()
+                    print(f"[!] Error processing frame {self.frame_count}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Update counters
+            self.frame_count += 1
+            fps_count += 1
+            
+            # FPS calculation
+            if time.time() - last_time > 1.0:
+                mode = "TSDF" if self.mesh_reconstruction else "PCL"
+                vis_mode = "Integrated" if self.show_integrated_model else "Current"
+                view_mode = self.visualization_mode.capitalize()
+                avg_reg_time = (np.mean(registration_times) if registration_times else 0)
+                print(f"[FPS] {fps_count} | Mode: {mode} | View: {vis_mode} ({view_mode}) | " + 
+                      f"Recording: {'ON' if self.is_recording else 'OFF'} | " + 
+                      f"Success: {success_count}/{self.frame_count} | Avg Reg: {avg_reg_time:.2f}s")
+                fps_count = 0
+                last_time = time.time()
+                registration_times = []
+            
+            # Update visualization
+            self.vis.poll_events()
+            self.vis.update_renderer()
 
     def cleanup(self):
         """Clean up resources"""
         try:
-            if self.vis is not None:
-                self.vis.destroy_window()
-                self.vis = None
+            self.k4a.stop()
         except:
             pass
-            
-        try:
-            if self.k4a is not None:
-                self.k4a.stop()
-                self.k4a = None
-        except:
-            pass
-            
-        print("[INFO] Cleanup completed. Program terminated.")
+        print("[INFO] Kinect stopped. Program terminated.")
 
 if __name__ == "__main__":
     KinectReconstructor().start_visualization()

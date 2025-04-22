@@ -13,3 +13,55 @@
 # Ignore all reconstruction outputs
 azure-kinect-DK/Reconstruction/reconstruction_output/
 azure-kinect-DK/Reconstruction/captures/
+
+# Ignore image files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.pdf
+*.ply
+*.obj
+
+# Ignore reconstruction outputs
+reconstruction_output/
+bundlefusion_output/
+rgbd_frames/
+color_frames/
+depth_frames/
+pose_graph/
+optimized_pose_graph/
+reconstructed_mesh/
+reconstructed_pointcloud/
+results/
+pointclouds/
+frames/
+data/
+pose_graph.json
+*.json
+
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore virtual environment
+venv/
+env/
+ai-cold-env/
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore logs
+*.log
+logs/
+
+# Ignore temporary files
+*.tmp
+*.temp
+.DS_Store

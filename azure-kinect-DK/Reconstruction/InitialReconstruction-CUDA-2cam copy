@@ -1,0 +1,1007 @@
+import numpy as np
+import open3d as o3d
+from pyk4a import PyK4A, Config, ColorResolution, DepthMode
+import cv2
+import time
+import os
+import copy
+import json
+
+class DualKinectReconstructor:
+    def __init__(self):
+        # Check for CUDA availability
+        self.cuda_available = False
+        try:
+            import cupy as cp
+            self.cuda_available = cp.cuda.runtime.getDeviceCount() > 0
+            self.cp = cp
+            if self.cuda_available:
+                print(f"[INFO] CUDA acceleration enabled - Device: {cp.cuda.runtime.getDeviceProperties(0)['name']}")
+            else:
+                print("[INFO] No CUDA device found, falling back to CPU")
+        except ImportError:
+            print("[INFO] CuPy not installed, running in CPU-only mode")
+        except Exception as e:
+            print(f"[WARNING] CUDA initialization failed: {e}")
+        
+        # Initialize two Kinect devices
+        print("[INFO] Initializing Kinect devices...")
+        self.k4a_devices = []
+        self.camera_serials = []
+        
+        # Find connected devices
+        self.detect_devices()
+        
+        if len(self.camera_serials) < 2:
+            print(f"[WARNING] Only {len(self.camera_serials)} Kinect device(s) detected. Two devices required for optimal reconstruction.")
+            if len(self.camera_serials) == 0:
+                raise RuntimeError("No Kinect devices detected. Exiting.")
+        
+        # Initialize cameras (max 2)
+        num_cameras = min(len(self.camera_serials), 2)
+        for i in range(num_cameras):
+            device = PyK4A(
+                Config(
+                    color_resolution=ColorResolution.RES_720P,
+                    depth_mode=DepthMode.NFOV_UNBINNED,
+                    synchronized_images_only=True,
+                ),
+                device_id=i
+            )
+            device.start()
+            self.k4a_devices.append(device)
+            print(f"[INFO] Camera {i} (Serial: {self.camera_serials[i]}) initialized")
+
+        # Camera intrinsics (use default values - will be updated from actual cameras)
+        self.intrinsics = [
+            o3d.camera.PinholeCameraIntrinsic(
+                width=1280, height=720,
+                fx=605.286, fy=605.699,
+                cx=637.134, cy=366.758
+            ) for _ in range(num_cameras)
+        ]
+        
+        # Camera extrinsics (transforms from each camera to world coordinate system)
+        # Initially identity matrices - will be calibrated
+        self.extrinsics = [np.identity(4) for _ in range(num_cameras)]
+
+        # Store flip transform in NumPy
+        # This matches the coordinate systems between Open3D (right-handed coordinates with +Z going away from the camera) and Kinect
+        self.flip_transform = np.array([
+            [1,  0,  0, 0],
+            [0, -1,  0, 0],
+            [0,  0, -1, 0],
+            [0,  0,  0, 1]
+        ])
+
+        # IMPORTANT: Parameters for reconstruction
+        self.voxel_size = 0.01  # Downsampling size
+        self.sdf_trunc = 0.04  # Truncation value for signed distance function, TSDF distance truncation for smoothing
+        self.block_resolution = 16  # Resolution of the TSDF volume block
+        self.block_count = 1000  # Initial number of blocks     #Used for GPU-based TSDF
+        
+        # Registration parameters
+        self.distance_threshold = 0.05  # For initial registration and alignment
+        self.icp_distance_threshold = 0.03  # For ICP refinement
+        self.keyframe_interval = 10  # Process every nth frame
+
+        # Setup visualization and model
+        self.frame_count = 0        # Track how many frames we have processed so far
+        self.is_recording = False   # Track capture progress
+        self.is_calibrated = False  # Track if cameras are calibrated
+        self.output_folder = "reconstruction_output"
+        os.makedirs(self.output_folder, exist_ok=True)
+        self.vis = None     # Open3D visualization window
+        
+        # State for tracking
+        self.volume = None
+        self.trajectory = []
+        self.current_transformation = np.identity(4)
+        self.mesh_reconstruction = True  # Whether to use TSDF volume for mesh reconstruction
+        
+        # Create initial point clouds for visualization
+        self.vis_pcds = [o3d.geometry.PointCloud() for _ in range(num_cameras)]
+        self.combined_vis_pcd = o3d.geometry.PointCloud()
+        
+        # For frame-to-frame tracking
+        self.prev_rgbds = [None for _ in range(num_cameras)]
+        self.prev_colors = [None for _ in range(num_cameras)]
+        self.prev_depths = [None for _ in range(num_cameras)]
+        
+        # For visualizing the integrated model
+        self.integrated_mesh = None
+        self.integrated_pcd = None
+        self.show_integrated_model = True  # Start by showing the integrated model by default
+        self.vis_update_interval = 5  # Update visualization every n frames
+        self.visualization_mode = "pointcloud"  # "pointcloud" or "mesh"
+        
+        # Calibration state
+        self.calibration_frames = []
+        self.calibration_pattern_size = (10, 7)  # Checkerboard size
+        self.calibration_complete = False
+
+        # Check Open3D CUDA
+        try:
+            self.o3d_cuda_available = (hasattr(o3d, 'core') and 
+                                      hasattr(o3d.core, 'cuda') and 
+                                      o3d.core.cuda.is_available())
+            if self.o3d_cuda_available:
+                print("[INFO] Open3D CUDA acceleration enabled")
+                self.device = o3d.core.Device("CUDA:0")
+            else:
+                print("[INFO] Open3D CUDA not available")
+                self.device = o3d.core.Device("CPU:0")
+        except Exception as e:
+            print(f"[WARNING] Open3D CUDA check failed: {e}")
+            self.o3d_cuda_available = False
+            self.device = None
+
+    def detect_devices(self):
+        """Detect connected Kinect devices"""
+        try:
+            # PyK4A doesn't directly expose device enumeration
+            # We'll try to open each device index and get serial numbers
+            max_devices = 10  # Arbitrary limit to prevent infinite loop
+            
+            for i in range(max_devices):
+                try:
+                    device = PyK4A(device_id=i)
+                    device.open()
+                    serial = device.serial
+                    self.camera_serials.append(serial)
+                    device.close()
+                    print(f"[INFO] Detected Kinect device: {serial} at index {i}")
+                except Exception as e:
+                    if "Failed to open device" in str(e) or "libusb device(s) are all unavailable" in str(e):
+                        # No more devices or this index doesn't exist
+                        break
+                    else:
+                        print(f"[WARNING] Error accessing device at index {i}: {e}")
+                        # If we get a USB error, try to close any open devices and retry
+                        try:
+                            device.close()
+                        except:
+                            pass
+                        time.sleep(0.1)
+                
+            print(f"[INFO] Found {len(self.camera_serials)} Kinect device(s)")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to enumerate devices: {e}")
+
+    def initialize_volume(self):
+        """Initialize TSDF volume for reconstruction"""
+        if not self.mesh_reconstruction:
+            return
+            
+        if hasattr(o3d, 'pipelines') and hasattr(o3d.pipelines, 'integration'):
+            try:
+                # Legacy ScalableTSDFVolume
+                self.volume = o3d.pipelines.integration.ScalableTSDFVolume(
+                    voxel_length=self.voxel_size,
+                    sdf_trunc=self.sdf_trunc,
+                    color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+                )
+                print("[INFO] Using legacy ScalableTSDFVolume")
+            except Exception as e:
+                print(f"[WARNING] Failed to initialize ScalableTSDFVolume: {e}")
+                self.mesh_reconstruction = False
+        else:
+            print("[WARNING] o3d.pipelines.integration not available")
+            self.mesh_reconstruction = False
+
+    def process_images(self, color_img, depth_img):
+        """Process color and depth images"""
+        # For stable color processing, use CPU
+        color_img = cv2.cvtColor(cv2.flip(color_img, -1), cv2.COLOR_BGR2RGB)
+        depth_img = cv2.flip(depth_img, -1)
+
+        # Create RGBD image
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(color_img),
+            o3d.geometry.Image(depth_img),
+            convert_rgb_to_intensity=False,
+            depth_scale=1000.0,
+            depth_trunc=3.0,
+        )
+        
+        return rgbd, color_img, depth_img
+
+    def capture_frames(self):
+        """Capture synchronized frames from all cameras"""
+        captures = []
+        for device in self.k4a_devices:
+            max_retries = 5
+            for _ in range(max_retries):
+                try:
+                    capture = device.get_capture()
+                    if capture.color is not None and capture.transformed_depth is not None:
+                        captures.append(capture)
+                        break
+                except Exception as e:
+                    print(f"[WARNING] Capture error: {e}")
+                    time.sleep(0.1)
+                    
+        return captures if len(captures) == len(self.k4a_devices) else None
+
+    def preprocess_point_cloud(self, pcd):
+        """Process point cloud for registration"""
+        # Remove outliers
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        
+        # Downsample
+        pcd = pcd.voxel_down_sample(self.voxel_size)
+        
+        # Estimate normals
+        pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+        pcd.orient_normals_towards_camera_location(np.array([0, 0, 0]))
+        
+        return pcd
+
+    def compute_features(self, pcd):
+        """Compute FPFH features for registration"""
+        return o3d.pipelines.registration.compute_fpfh_feature(
+            pcd, o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 5, max_nn=100)
+        )
+
+    def global_registration(self, source, target):
+        """Perform global registration with RANSAC"""
+        source_down = source.voxel_down_sample(self.voxel_size * 2)
+        target_down = target.voxel_down_sample(self.voxel_size * 2)
+        
+        source_fpfh = self.compute_features(source_down)
+        target_fpfh = self.compute_features(target_down)
+        
+        result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+            source_down, target_down,
+            source_fpfh, target_fpfh,
+            mutual_filter=True,
+            max_correspondence_distance=self.distance_threshold * 2,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+            ransac_n=4,
+            checkers=[
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(self.distance_threshold * 2)
+            ],
+            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(4000000, 500)
+        )
+        
+        if result.fitness < 0.3:
+            print(f"[WARNING] Low global registration fitness: {result.fitness:.3f}")
+            return None
+            
+        return result.transformation
+
+    def icp_registration(self, source, target, init_transform=None):
+        """Perform ICP registration"""
+        if init_transform is None:
+            init_transform = np.identity(4)
+            
+        result = o3d.pipelines.registration.registration_icp(
+            source, target, self.icp_distance_threshold, init_transform,
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100)
+        )
+        
+        if result.fitness < 0.5:
+            print(f"[WARNING] Low ICP fitness: {result.fitness:.3f}")
+            return None
+            
+        return result.transformation
+
+    def register_frames(self, source_pcd, target_pcd):
+        """Register source to target point cloud"""
+        # First try standard registration pipeline
+        global_transform = self.global_registration(source_pcd, target_pcd)
+        if global_transform is None:
+            return None
+            
+        # Refine with ICP
+        transform = self.icp_registration(source_pcd, target_pcd, global_transform)
+        if transform is None:
+            return None
+            
+        return transform
+
+    def calibrate_cameras(self):
+        """Calibrate multiple cameras to establish relative poses"""
+        if len(self.k4a_devices) < 2:
+            print("[WARNING] Camera calibration requires at least 2 devices")
+            return False
+            
+        print("\n[INFO] Starting camera calibration...")
+        print("Please place a checkerboard pattern visible to all cameras.")
+        print(f"Expected pattern size: {self.calibration_pattern_size[0]}x{self.calibration_pattern_size[1]}")
+        print("Press Space to capture calibration frame (at least 5 frames recommended)")
+        print("Press Enter when done capturing calibration frames")
+        
+        calibration_points_3d = []
+        calibration_points_2d = [[] for _ in range(len(self.k4a_devices))]
+        
+        # Generate 3D points of the checkerboard pattern
+        pattern_points = np.zeros((self.calibration_pattern_size[0] * self.calibration_pattern_size[1], 3), np.float32)
+        pattern_points[:, :2] = np.mgrid[0:self.calibration_pattern_size[0], 0:self.calibration_pattern_size[1]].T.reshape(-1, 2) * 0.03  # 3cm squares
+        
+        self.visualization_mode = "pointcloud"
+        calibration_window = o3d.visualization.VisualizerWithKeyCallback()
+        calibration_window.create_window("Camera Calibration", 1280, 720)
+        
+        # Register keyboard callbacks
+        calibration_window.register_key_callback(32, self.capture_calibration_frame)  # Space bar
+        calibration_window.register_key_callback(13, self.complete_calibration)       # Enter key
+        
+        # Display live feed for calibration
+        cv_windows = []
+        for i in range(len(self.k4a_devices)):
+            window_name = f"Camera {i} View"
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, 640, 360)
+            cv_windows.append(window_name)
+        
+        # Calibration state
+        self.calibration_frames = []
+        self.calibration_complete = False
+        
+        while not self.calibration_complete:
+            # Capture frames from all cameras
+            captures = self.capture_frames()
+            if not captures:
+                continue
+                
+            # Process and display
+            for i, capture in enumerate(captures):
+                color_img = cv2.cvtColor(capture.color, cv2.COLOR_BGR2RGB)
+                cv2.imshow(cv_windows[i], color_img)
+                
+                # Try to detect checkerboard for feedback
+                gray = cv2.cvtColor(color_img, cv2.COLOR_RGB2GRAY)
+                ret, corners = cv2.findChessboardCorners(gray, self.calibration_pattern_size, None)
+                
+                if ret:
+                    # Refine corners
+                    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+                    corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+                    
+                    # Draw and display the corners
+                    cv2.drawChessboardCorners(color_img, self.calibration_pattern_size, corners2, ret)
+                    cv2.imshow(cv_windows[i], color_img)
+            
+            calibration_window.poll_events()
+            calibration_window.update_renderer()
+            
+            # Handle keyboard input
+            key = cv2.waitKey(1)
+            if key == 27:  # ESC key
+                self.calibration_complete = True
+                break
+            elif key == 32:  # Space bar
+                self.capture_calibration_frame(calibration_window)
+            elif key == 13:  # Enter key
+                self.complete_calibration(calibration_window)
+                
+        # Clean up calibration windows
+        for window in cv_windows:
+            cv2.destroyWindow(window)
+        calibration_window.destroy_window()
+        
+        # Process calibration data
+        if len(self.calibration_frames) < 5:
+            print("[WARNING] Not enough calibration frames. At least 5 recommended.")
+            if len(self.calibration_frames) == 0:
+                print("[ERROR] No calibration frames captured. Using default configuration.")
+                return False
+                
+        # Process all calibration frames
+        print(f"[INFO] Processing {len(self.calibration_frames)} calibration frames...")
+        
+        # Extract camera parameters
+        camera_matrices = []
+        dist_coeffs = []
+        
+        # First calibrate each camera individually
+        for i in range(len(self.k4a_devices)):
+            # Get camera data
+            obj_points = []
+            img_points = []
+            
+            for frame in self.calibration_frames:
+                if frame[i]['corners'] is not None:
+                    obj_points.append(pattern_points)
+                    img_points.append(frame[i]['corners'])
+            
+            if len(obj_points) < 5:
+                print(f"[WARNING] Camera {i} has too few valid calibration frames ({len(obj_points)})")
+                continue
+                
+            # Calibrate individual camera
+            ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
+                obj_points, img_points, frame[i]['color'].shape[:2][::-1], None, None
+            )
+            
+            camera_matrices.append(mtx)
+            dist_coeffs.append(dist)
+            
+            # Update intrinsics
+            self.intrinsics[i] = o3d.camera.PinholeCameraIntrinsic(
+                width=frame[i]['color'].shape[1],
+                height=frame[i]['color'].shape[0],
+                fx=mtx[0, 0], fy=mtx[1, 1],
+                cx=mtx[0, 2], cy=mtx[1, 2]
+            )
+            
+            print(f"[INFO] Camera {i} calibration complete")
+            print(f"  - Intrinsic matrix:\n{mtx}")
+            
+        # Now calibrate stereo pairs to get extrinsics
+        if len(self.k4a_devices) >= 2 and len(camera_matrices) >= 2:
+            # Use first camera as reference (world coordinate system)
+            reference_camera = 0
+            self.extrinsics[reference_camera] = np.identity(4)
+            
+            # Calibrate other cameras relative to reference
+            for i in range(1, len(self.k4a_devices)):
+                # Check if we have enough mutual observations
+                mutual_frames = []
+                mutual_obj_points = []
+                ref_img_points = []
+                cam_img_points = []
+                
+                for frame in self.calibration_frames:
+                    if frame[reference_camera]['corners'] is not None and frame[i]['corners'] is not None:
+                        mutual_frames.append(frame)
+                        mutual_obj_points.append(pattern_points)
+                        ref_img_points.append(frame[reference_camera]['corners'])
+                        cam_img_points.append(frame[i]['corners'])
+                
+                if len(mutual_frames) < 5:
+                    print(f"[WARNING] Not enough mutual observations between cameras {reference_camera} and {i}")
+                    continue
+                
+                # Stereo calibration to get relative rotation and translation
+                ret, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
+                    mutual_obj_points, ref_img_points, cam_img_points,
+                    camera_matrices[reference_camera], dist_coeffs[reference_camera],
+                    camera_matrices[i], dist_coeffs[i],
+                    mutual_frames[0][reference_camera]['color'].shape[:2][::-1],
+                    None, None
+                )
+                
+                # Convert rotation matrix from Rodrigues format
+                R_mat, _ = cv2.Rodrigues(R)
+                
+                # Build 4x4 transformation matrix (from cam i to reference)
+                self.extrinsics[i] = np.identity(4)
+                self.extrinsics[i][:3, :3] = R_mat
+                self.extrinsics[i][:3, 3] = T.flatten()
+                
+                print(f"[INFO] Relative transform from camera {i} to reference camera:")
+                print(self.extrinsics[i])
+            
+            # Save calibration results
+            self.save_calibration()
+            self.is_calibrated = True
+            print("[INFO] Camera calibration complete")
+            return True
+        else:
+            print("[WARNING] Could not complete multi-camera calibration")
+            return False
+
+    def capture_calibration_frame(self, vis):
+        """Capture a frame for calibration when space bar is pressed"""
+        captures = self.capture_frames()
+        if not captures:
+            print("[WARNING] Failed to capture frames from all cameras")
+            return False
+            
+        # Create a new calibration frame
+        calibration_frame = []
+        
+        for i, capture in enumerate(captures):
+            color_img = cv2.cvtColor(capture.color, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(color_img, cv2.COLOR_RGB2GRAY)
+            
+            # Find checkerboard corners
+            ret, corners = cv2.findChessboardCorners(gray, self.calibration_pattern_size, None)
+            
+            if ret:
+                # Refine corners
+                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+                corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+                
+                # Save detection data
+                calibration_frame.append({
+                    'color': color_img,
+                    'corners': corners2
+                })
+                
+                # Mark as successful
+                print(f"[+] Camera {i}: Checkerboard detected")
+            else:
+                # Save frame but mark corners as None
+                calibration_frame.append({
+                    'color': color_img,
+                    'corners': None
+                })
+                print(f"[-] Camera {i}: No checkerboard detected")
+        
+        # Check if any camera detected the pattern
+        if any(frame['corners'] is not None for frame in calibration_frame):
+            self.calibration_frames.append(calibration_frame)
+            print(f"[INFO] Calibration frame {len(self.calibration_frames)} captured")
+        else:
+            print("[WARNING] No checkerboard detected in any camera")
+            
+        return True
+
+    def complete_calibration(self, vis):
+        """Complete calibration process when Enter key is pressed"""
+        self.calibration_complete = True
+        print("[INFO] Calibration capture complete")
+        return True
+
+    def save_calibration(self):
+        """Save calibration data to file"""
+        calibration_data = {
+            "timestamp": time.strftime("%Y%m%d-%H%M%S"),
+            "num_cameras": len(self.k4a_devices),
+            "camera_serials": self.camera_serials,
+            "intrinsics": [],
+            "extrinsics": []
+        }
+        
+        # Save intrinsics
+        for i, intrinsic in enumerate(self.intrinsics):
+            calibration_data["intrinsics"].append({
+                "width": intrinsic.width,
+                "height": intrinsic.height,
+                "fx": intrinsic.get_focal_length()[0],
+                "fy": intrinsic.get_focal_length()[1],
+                "cx": intrinsic.get_principal_point()[0],
+                "cy": intrinsic.get_principal_point()[1]
+            })
+        
+        # Save extrinsics
+        for i, extrinsic in enumerate(self.extrinsics):
+            calibration_data["extrinsics"].append(extrinsic.tolist())
+        
+        # Save to file
+        calibration_file = f"{self.output_folder}/calibration_{time.strftime('%Y%m%d-%H%M%S')}.json"
+        with open(calibration_file, 'w') as f:
+            json.dump(calibration_data, f, indent=4)
+            
+        print(f"[INFO] Calibration saved to {calibration_file}")
+
+    def load_calibration(self, calibration_file=None):
+        """Load calibration data from file"""
+        if calibration_file is None:
+            # Find most recent calibration file
+            calibration_files = [f for f in os.listdir(self.output_folder) if f.startswith("calibration_") and f.endswith(".json")]
+            if not calibration_files:
+                print("[WARNING] No calibration files found")
+                return False
+                
+            calibration_files.sort(reverse=True)
+            calibration_file = os.path.join(self.output_folder, calibration_files[0])
+        
+        try:
+            with open(calibration_file, 'r') as f:
+                calibration_data = json.load(f)
+                
+            # Validate camera count
+            if calibration_data["num_cameras"] != len(self.k4a_devices):
+                print(f"[WARNING] Calibration file has {calibration_data['num_cameras']} cameras, but {len(self.k4a_devices)} are connected")
+                
+            # Validate camera serials if available
+            if "camera_serials" in calibration_data:
+                for i, serial in enumerate(calibration_data["camera_serials"]):
+                    if i < len(self.camera_serials) and serial != self.camera_serials[i]:
+                        print(f"[WARNING] Camera serial mismatch: Expected {serial}, got {self.camera_serials[i]}")
+            
+            # Load intrinsics
+            for i, intrinsic_data in enumerate(calibration_data["intrinsics"]):
+                if i < len(self.intrinsics):
+                    self.intrinsics[i] = o3d.camera.PinholeCameraIntrinsic(
+                        width=intrinsic_data["width"],
+                        height=intrinsic_data["height"],
+                        fx=intrinsic_data["fx"],
+                        fy=intrinsic_data["fy"],
+                        cx=intrinsic_data["cx"],
+                        cy=intrinsic_data["cy"]
+                    )
+            
+            # Load extrinsics
+            for i, extrinsic_data in enumerate(calibration_data["extrinsics"]):
+                if i < len(self.extrinsics):
+                    self.extrinsics[i] = np.array(extrinsic_data)
+            
+            print(f"[INFO] Loaded calibration from {calibration_file}")
+            self.is_calibrated = True
+            return True
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to load calibration: {e}")
+            return False
+
+    def combine_point_clouds(self, point_clouds):
+        """Combine point clouds from multiple cameras into a single point cloud"""
+        if len(point_clouds) == 0:
+            return None
+            
+        # If only one point cloud, return it
+        if len(point_clouds) == 1:
+            return copy.deepcopy(point_clouds[0])
+        
+        # Combine point clouds using extrinsics
+        combined = o3d.geometry.PointCloud()
+        
+        for i, pcd in enumerate(point_clouds):
+            # Make a copy
+            transformed_pcd = copy.deepcopy(pcd)
+            
+            # Transform from camera to world coordinate system
+            if i > 0:  # First camera is already in world coordinates
+                transformed_pcd.transform(np.linalg.inv(self.extrinsics[i]))
+            
+            # Add to combined point cloud
+            combined += transformed_pcd
+        
+        # Downsample to remove duplicate points
+        combined = combined.voxel_down_sample(self.voxel_size)
+        
+        return combined
+
+    def register_frame_to_model(self, frame_pcd, model_pcd):
+        """Register current frame to the global model"""
+        # Downsample for faster registration
+        frame_down = frame_pcd.voxel_down_sample(self.voxel_size * 2)
+        model_down = model_pcd.voxel_down_sample(self.voxel_size * 2)
+        
+        # Try fast ICP first with previous transformation as initialization
+        try:
+            result = o3d.pipelines.registration.registration_icp(
+                frame_down, model_down, 
+                self.distance_threshold,
+                self.current_transformation,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint()
+            )
+            
+            if result.fitness > 0.6:
+                return result.transformation
+        except Exception as e:
+            print(f"[WARNING] Fast ICP failed: {e}")
+        
+        # Fall back to full registration pipeline
+        return self.register_frames(frame_down, model_down)
+
+    def add_rgbd_to_volume(self, rgbd, transform):
+        """Add an RGBD frame to the TSDF volume"""
+        if not self.mesh_reconstruction or self.volume is None:
+            return
+            
+        try:
+            self.volume.integrate(rgbd, self.intrinsics[0], np.linalg.inv(transform))
+        except Exception as e:
+            print(f"[WARNING] Failed to integrate frame into volume: {e}")
+
+    def update_visualization_model(self):
+        """Update the visualization model from the TSDF volume"""
+        if not self.mesh_reconstruction or self.volume is None:
+            return False
+        
+        try:
+            print("[INFO] Updating visualization model...")
+            
+            if self.visualization_mode == "mesh":
+                # Extract mesh from TSDF volume
+                self.integrated_mesh = self.volume.extract_triangle_mesh()
+                self.integrated_mesh.compute_vertex_normals()
+                return len(self.integrated_mesh.triangles) > 0
+            else:  # pointcloud mode
+                # Extract point cloud from TSDF volume
+                self.integrated_pcd = self.volume.extract_point_cloud()
+                self.integrated_pcd = self.integrated_pcd.voxel_down_sample(self.voxel_size)
+                self.integrated_pcd.estimate_normals()
+                return len(self.integrated_pcd.points) > 0
+                
+        except Exception as e:
+            print(f"[WARNING] Failed to update visualization model: {e}")
+            return False
+
+    def start_reconstruction(self):
+        """Start the reconstruction process"""
+        print("[INFO] Starting reconstruction...")
+        self.is_recording = True
+        self.frame_count = 0
+        
+        # Initialize visualization
+        self.initialize_visualization()
+        
+        # Initialize TSDF volume
+        if self.mesh_reconstruction:
+            self.initialize_volume()
+        
+        # Main reconstruction loop
+        try:
+            while self.is_recording:
+                # Capture frames from all cameras
+                captures = self.capture_frames()
+                if not captures:
+                    continue
+                
+                # Process frames
+                rgbds = []
+                point_clouds = []
+                
+                for i, capture in enumerate(captures):
+                    # Process color and depth images
+                    rgbd, color_img, depth_img = self.process_images(
+                        capture.color, capture.transformed_depth
+                    )
+                    rgbds.append(rgbd)
+                    
+                    # Create point cloud from RGBD
+                    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
+                        rgbd, self.intrinsics[i]
+                    )
+                    
+                    # Apply flip transform to match coordinate system
+                    pcd.transform(self.flip_transform)
+                    
+                    # Preprocess point cloud for registration
+                    pcd = self.preprocess_point_cloud(pcd)
+                    
+                    # Transform from camera coordinate system to world coordinate system
+                    if i > 0:  # First camera is already in world coordinates
+                        pcd.transform(np.linalg.inv(self.extrinsics[i]))
+                    
+                    point_clouds.append(pcd)
+                    
+                    # Update visualization point clouds
+                    self.vis_pcds[i] = pcd
+                
+                # Combine point clouds from all cameras
+                combined_pcd = self.combine_point_clouds(point_clouds)
+                
+                # Update trajectory with current frame
+                if self.frame_count == 0:
+                    # First frame, initialize model
+                    self.current_transformation = np.identity(4)
+                    self.trajectory.append(self.current_transformation)
+                    self.integrated_pcd = copy.deepcopy(combined_pcd)
+                    
+                    # Add first frame to volume
+                    if self.mesh_reconstruction:
+                        self.add_rgbd_to_volume(rgbds[0], self.current_transformation)
+                
+                elif self.frame_count % self.keyframe_interval == 0:
+                    # Register current frame to model
+                    transform = self.register_frame_to_model(combined_pcd, self.integrated_pcd)
+                    
+                    if transform is not None:
+                        # Update current transformation
+                        self.current_transformation = transform
+                        self.trajectory.append(self.current_transformation)
+                        
+                        # Add frame to volume
+                        if self.mesh_reconstruction:
+                            self.add_rgbd_to_volume(rgbds[0], self.current_transformation)
+                        
+                        # Update integrated point cloud
+                        temp_pcd = copy.deepcopy(combined_pcd)
+                        temp_pcd.transform(self.current_transformation)
+                        self.integrated_pcd += temp_pcd
+                        self.integrated_pcd = self.integrated_pcd.voxel_down_sample(self.voxel_size)
+                
+                # Update combined visualization point cloud
+                self.combined_vis_pcd = combined_pcd
+                
+                # Update visualization
+                if self.frame_count % self.vis_update_interval == 0:
+                    if self.show_integrated_model and self.frame_count > 0:
+                        if self.mesh_reconstruction:
+                            self.update_visualization_model()
+                    self.update_visualization()
+                
+                # Store previous frame data
+                self.prev_rgbds = rgbds
+                
+                # Update frame counter
+                self.frame_count += 1
+                
+                # Check for keyboard input
+                if not self.handle_user_input():
+                    break
+                    
+        except KeyboardInterrupt:
+            print("[INFO] Reconstruction interrupted by user")
+        finally:
+            # Finalize reconstruction
+            self.finalize_reconstruction()
+
+    def initialize_visualization(self):
+        """Initialize Open3D visualization"""
+        self.vis = o3d.visualization.VisualizerWithKeyCallback()
+        self.vis.create_window("3D Reconstruction", 1280, 720)
+        
+        # Add point clouds to visualizer
+        for pcd in self.vis_pcds:
+            self.vis.add_geometry(pcd)
+        
+        # Add combined point cloud
+        self.vis.add_geometry(self.combined_vis_pcd)
+        
+        # Set rendering options
+        opt = self.vis.get_render_option()
+        opt.background_color = np.array([0.1, 0.1, 0.1])
+        opt.point_size = 2.0
+        
+        # Set view control
+        vc = self.vis.get_view_control()
+        vc.set_zoom(0.5)
+        
+        # Register keyboard callbacks
+        self.vis.register_key_callback(ord('Q'), self.toggle_quit)
+        self.vis.register_key_callback(ord('M'), self.toggle_visualization_mode)
+        self.vis.register_key_callback(ord('I'), self.toggle_integrated_view)
+        self.vis.register_key_callback(ord('S'), self.save_current_reconstruction)
+
+    def update_visualization(self):
+        """Update visualization with current state"""
+        # Update camera point clouds
+        for i, pcd in enumerate(self.vis_pcds):
+            self.vis.update_geometry(pcd)
+        
+        # Update combined point cloud
+        self.vis.update_geometry(self.combined_vis_pcd)
+        
+        # Update integrated model if showing
+        if self.show_integrated_model:
+            if self.visualization_mode == "mesh" and self.integrated_mesh is not None:
+                # Remove old mesh if it exists
+                try:
+                    self.vis.remove_geometry(self.integrated_mesh, False)
+                except:
+                    pass
+                # Add new mesh
+                self.vis.add_geometry(self.integrated_mesh, False)
+            elif self.visualization_mode == "pointcloud" and self.integrated_pcd is not None:
+                # Remove old point cloud if it exists
+                try:
+                    self.vis.remove_geometry(self.integrated_pcd, False)
+                except:
+                    pass
+                # Add new point cloud
+                self.vis.add_geometry(self.integrated_pcd, False)
+        
+        # Update view
+        self.vis.poll_events()
+        self.vis.update_renderer()
+
+    def handle_user_input(self):
+        """Handle user input during reconstruction"""
+        # Process keyboard input from visualization window
+        self.vis.poll_events()
+        
+        # Check for quit flag
+        if not self.is_recording:
+            return False
+            
+        return True
+
+    def toggle_quit(self, vis):
+        """Toggle quit flag when Q is pressed"""
+        print("[INFO] Quitting reconstruction...")
+        self.is_recording = False
+        return True
+
+    def toggle_visualization_mode(self, vis):
+        """Toggle between mesh and point cloud visualization modes"""
+        if self.visualization_mode == "mesh":
+            self.visualization_mode = "pointcloud"
+            print("[INFO] Visualization mode: Point Cloud")
+        else:
+            self.visualization_mode = "mesh"
+            print("[INFO] Visualization mode: Mesh")
+        
+        # Update visualization model
+        if self.show_integrated_model:
+            self.update_visualization_model()
+            
+        return True
+
+    def toggle_integrated_view(self, vis):
+        """Toggle between showing raw point clouds and integrated model"""
+        self.show_integrated_model = not self.show_integrated_model
+        
+        if self.show_integrated_model:
+            print("[INFO] Showing integrated model")
+            self.update_visualization_model()
+        else:
+            print("[INFO] Showing raw point clouds")
+            
+            # Remove integrated model from visualization
+            if self.visualization_mode == "mesh" and self.integrated_mesh is not None:
+                self.vis.remove_geometry(self.integrated_mesh, False)
+            elif self.integrated_pcd is not None:
+                self.vis.remove_geometry(self.integrated_pcd, False)
+                
+        return True
+
+    def save_current_reconstruction(self, vis):
+        """Save current reconstruction when S is pressed"""
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        
+        try:
+            # Save trajectory
+            trajectory_file = f"{self.output_folder}/trajectory_{timestamp}.json"
+            trajectory_data = {
+                "frames": len(self.trajectory),
+                "transforms": [t.tolist() for t in self.trajectory]
+            }
+            with open(trajectory_file, 'w') as f:
+                json.dump(trajectory_data, f, indent=4)
+            print(f"[INFO] Saved trajectory to {trajectory_file}")
+            
+            # Save integrated model
+            if self.mesh_reconstruction and self.integrated_mesh is not None:
+                mesh_file = f"{self.output_folder}/mesh_{timestamp}.ply"
+                o3d.io.write_triangle_mesh(mesh_file, self.integrated_mesh)
+                print(f"[INFO] Saved mesh to {mesh_file}")
+            
+            # Save point cloud
+            if self.integrated_pcd is not None:
+                pcd_file = f"{self.output_folder}/pointcloud_{timestamp}.ply"
+                o3d.io.write_point_cloud(pcd_file, self.integrated_pcd)
+                print(f"[INFO] Saved point cloud to {pcd_file}")
+                
+            print("[INFO] Reconstruction saved successfully")
+            return True
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to save reconstruction: {e}")
+            return False
+
+    def finalize_reconstruction(self):
+        """Finalize the reconstruction process"""
+        print("[INFO] Finalizing reconstruction...")
+        
+        # Save final model
+        self.save_current_reconstruction(None)
+        
+        # Close visualization
+        if self.vis is not None:
+            self.vis.destroy_window()
+            self.vis = None
+        
+        # Release camera resources
+        for device in self.k4a_devices:
+            device.stop()
+            
+        print(f"[INFO] Reconstruction complete. Processed {self.frame_count} frames.")
+
+def main():
+    """Main function"""
+    print("==== Dual Kinect 3D Reconstruction System ====")
+    
+    try:
+        # Create reconstructor
+        reconstructor = DualKinectReconstructor()
+        
+        # Check if calibration data exists
+        if not reconstructor.is_calibrated:
+            # Try to load calibration
+            if not reconstructor.load_calibration():
+                # Perform calibration
+                print("\n[INFO] No calibration data found or loaded. Calibrating cameras...")
+                reconstructor.calibrate_cameras()
+        
+        # Start reconstruction
+        reconstructor.start_reconstruction()
+        
+    except Exception as e:
+        print(f"[ERROR] An error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+    
+if __name__ == "__main__":
+    main()
