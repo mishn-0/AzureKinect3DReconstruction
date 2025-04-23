@@ -349,8 +349,8 @@ class MultiKinectMeshReconstructor:
         self.integrated_pcd = None
         self.merged_pcd = None
         self.camera_colors = [
-            [1, 0.7, 0.7],  # Light red for camera 0
-            [0.7, 0.7, 1]   # Light blue for camera 1
+            [0.7, 0.0, 0.0],  # Light Red for camera 0
+            [0.0, 0.0, 0.7]   # Light Blue for camera 1
         ]
         self.show_original_clouds = False  # Toggle to show unmerged clouds
         self.extrinsic_calibration_done = False
@@ -358,8 +358,7 @@ class MultiKinectMeshReconstructor:
         
         # New color mode states
         self.use_colors = True  # Enable color by default
-        self.visualization_color_mode = "original"  # Options: "original", "uniform", "camera"
-        self.reconstruction_color_mode = "original"  # Options: "original", "uniform"
+        self.color_mode = "original"  # Options: "original", "uniform", "camera"
         
         os.makedirs(self.output_folder, exist_ok=True)
         
@@ -462,46 +461,11 @@ class MultiKinectMeshReconstructor:
         
     def register_callbacks(self):
         """Register keyboard callbacks for the visualizer"""
-        def toggle_mesh_reconstruction(vis):
-            self.mesh_reconstruction = not self.mesh_reconstruction
-            print(f"Mesh reconstruction: {'enabled' if self.mesh_reconstruction else 'disabled'}")
-            return True
-            
-        def toggle_visualization_mode(vis):
-            self.visualization_mode = "mesh" if self.visualization_mode == "pointcloud" else "pointcloud"
-            print(f"Visualization mode: {self.visualization_mode}")
-            return True
-        
-        def toggle_original_clouds(vis):
-            self.show_original_clouds = not self.show_original_clouds
-            print(f"Show original clouds: {'enabled' if self.show_original_clouds else 'disabled'}")
-            return True
-        
-        def toggle_tsdf_integration(vis):
-            self.use_tsdf = not self.use_tsdf
-            if self.use_tsdf:
-                # Reset TSDF volume when re-enabling
-                self.tsdf_integrator.reset_volume()
-            print(f"TSDF integration: {'enabled' if self.use_tsdf else 'disabled'}")
-            return True
-            
-        def toggle_colors(vis):
-            self.use_colors = not self.use_colors
-            print(f"Color visualization: {'enabled' if self.use_colors else 'disabled'}")
-            return True
-            
-        def cycle_visualization_color_mode(vis):
+        def cycle_color_mode(vis):
             modes = ["original", "uniform", "camera"]
-            current_idx = modes.index(self.visualization_color_mode)
-            self.visualization_color_mode = modes[(current_idx + 1) % len(modes)]
-            print(f"Visualization color mode: {self.visualization_color_mode}")
-            return True
-            
-        def cycle_reconstruction_color_mode(vis):
-            modes = ["original", "uniform"]
-            current_idx = modes.index(self.reconstruction_color_mode)
-            self.reconstruction_color_mode = modes[(current_idx + 1) % len(modes)]
-            print(f"Reconstruction color mode: {self.reconstruction_color_mode}")
+            current_idx = modes.index(self.color_mode)
+            self.color_mode = modes[(current_idx + 1) % len(modes)]
+            print(f"Color mode: {self.color_mode}")
             return True
             
         def save_current_state(vis):
@@ -528,16 +492,9 @@ class MultiKinectMeshReconstructor:
             return True
         
         # Register key callbacks
-        self.vis.register_key_callback(ord("M"), toggle_mesh_reconstruction)   # M to toggle mesh reconstruction
-        self.vis.register_key_callback(ord("V"), toggle_visualization_mode)    # V to toggle visualization mode
-        self.vis.register_key_callback(ord("O"), toggle_original_clouds)       # O to toggle original cloud view
-        self.vis.register_key_callback(ord("T"), toggle_tsdf_integration)      # T to toggle TSDF integration
-        self.vis.register_key_callback(ord("C"), toggle_colors)                # C to toggle colors
-        self.vis.register_key_callback(ord("K"), cycle_visualization_color_mode)  # K to cycle visualization color mode
-        self.vis.register_key_callback(ord("L"), cycle_reconstruction_color_mode) # L to cycle reconstruction color mode
+        self.vis.register_key_callback(ord("C"), cycle_color_mode)             # C to cycle color modes
         self.vis.register_key_callback(ord("S"), save_current_state)           # S to save current state
         self.vis.register_key_callback(ord("R"), recalibrate_cameras)          # R to recalibrate cameras
-        self.vis.register_key_callback(ord("Z"), lambda vis: self.setup_camera_view() or True)  # Z to reset view
     
     def process_frame(self, color_img, depth_img, intrinsic):
         """Process a single frame from the Kinect"""
@@ -625,6 +582,24 @@ class MultiKinectMeshReconstructor:
             print("Calibration failed: Not enough overlap between cameras")
             return False
     
+    def display_camera_info(self, camera_id):
+        """Display camera information in the console"""
+        if camera_id == 0:
+            print(f"Camera {camera_id} (Reference)")
+        else:
+            if self.camera_extrinsics[camera_id] is not None:
+                # Extract translation and rotation
+                translation = self.camera_extrinsics[camera_id][:3, 3]
+                rotation_matrix = self.camera_extrinsics[camera_id][:3, :3]
+                angles = np.degrees(np.array([
+                    np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2]),
+                    np.arctan2(-rotation_matrix[2, 0], np.sqrt(rotation_matrix[2, 1]**2 + rotation_matrix[2, 2]**2)),
+                    np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
+                ]))
+                print(f"Camera {camera_id} - Position: {translation}, Rotation: {angles}")
+            else:
+                print(f"Camera {camera_id} (Not calibrated)")
+
     def update_visualization(self, frames):
         """Update the visualization with the current point cloud or mesh"""
         self.vis.clear_geometries()
@@ -653,12 +628,10 @@ class MultiKinectMeshReconstructor:
         if self.show_original_clouds:
             for i, pcd in enumerate(point_clouds):
                 temp_pcd = copy.deepcopy(pcd)
-                if not self.use_colors:
-                    temp_pcd.paint_uniform_color([0.5, 0.5, 0.5])  # Gray if colors disabled
-                elif self.visualization_color_mode == "camera":
-                    temp_pcd.paint_uniform_color(self.camera_colors[i])
-                elif self.visualization_color_mode == "uniform":
+                if self.color_mode == "uniform":
                     temp_pcd.paint_uniform_color([0.7, 0.7, 0.7])  # Light gray
+                elif self.color_mode == "camera":
+                    temp_pcd.paint_uniform_color(self.camera_colors[i])
                 # "original" mode keeps original colors
                 
                 if i > 0 and self.extrinsic_calibration_done and self.camera_extrinsics[i] is not None:
@@ -667,23 +640,29 @@ class MultiKinectMeshReconstructor:
         
         # If we have calibration, show the merged point cloud
         if self.extrinsic_calibration_done and len(point_clouds) >= 2:
-            merged_pcd = point_clouds[0]
-            for i in range(1, len(point_clouds)):
-                if self.camera_extrinsics[i] is not None:
-                    temp_pcd = copy.deepcopy(point_clouds[i])
+            # Create separate point clouds for each camera with their colors
+            camera_clouds = []
+            for i, pcd in enumerate(point_clouds):
+                temp_pcd = copy.deepcopy(pcd)
+                if i > 0 and self.camera_extrinsics[i] is not None:
                     temp_pcd.transform(self.camera_extrinsics[i])
-                    merged_pcd += temp_pcd
+                if self.color_mode == "camera":
+                    temp_pcd.paint_uniform_color(self.camera_colors[i])
+                camera_clouds.append(temp_pcd)
+            
+            # Merge point clouds
+            merged_pcd = camera_clouds[0]
+            for i in range(1, len(camera_clouds)):
+                merged_pcd += camera_clouds[i]
             
             # Downsample the merged point cloud while preserving colors
             merged_pcd = merged_pcd.voxel_down_sample(self.voxel_size)
             self.merged_pcd = merged_pcd
             
             # Apply color mode to merged point cloud
-            if not self.use_colors:
-                merged_pcd.paint_uniform_color([0.5, 0.5, 0.5])  # Gray if colors disabled
-            elif self.visualization_color_mode == "uniform":
+            if self.color_mode == "uniform":
                 merged_pcd.paint_uniform_color([0.7, 0.7, 0.7])  # Light gray
-            # "original" and "camera" modes keep original colors
+            # "original" and "camera" modes keep their colors from above
             
             self.vis.add_geometry(merged_pcd)
         
@@ -718,16 +697,9 @@ class MultiKinectMeshReconstructor:
         time.sleep(2)
         
         print("\nControls:")
-        print("  M - Toggle mesh reconstruction")
-        print("  V - Toggle visualization mode (point cloud/mesh)")
-        print("  O - Toggle original point clouds view")
-        print("  T - Toggle TSDF integration")
-        print("  C - Toggle colors")
-        print("  K - Cycle visualization color mode (original/uniform/camera)")
-        print("  L - Cycle reconstruction color mode (original/uniform)")
+        print("  C - Cycle color modes (original/uniform/camera)")
         print("  S - Save current reconstruction")
         print("  R - Recalibrate cameras")
-        print("  Z - Reset camera view")
         print("  Ctrl+C - Stop streaming")
         
         try:
