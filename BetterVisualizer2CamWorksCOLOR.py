@@ -296,7 +296,7 @@ class TSDFIntegration:
     
     def reset_volume(self):
         """Reset the TSDF volume"""
-        # Create TSDF volume
+        # Create TSDF volume with color support
         self.volume = o3d.pipelines.integration.ScalableTSDFVolume(
             voxel_length=self.voxel_length,
             sdf_trunc=self.sdf_trunc,
@@ -305,26 +305,32 @@ class TSDFIntegration:
     
     def integrate_frame(self, color_img, depth_img, intrinsic, extrinsic=np.eye(4)):
         """Integrate a frame into the TSDF volume"""
-        # Create RGBD image
+        # Create RGBD image with proper color handling
         color_o3d = o3d.geometry.Image(color_img)
         depth_o3d = o3d.geometry.Image(depth_img)
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color_o3d, depth_o3d,
             depth_scale=1000.0,  # Azure Kinect depth is in mm
             depth_trunc=3.0,     # 3 meters max depth
-            convert_rgb_to_intensity=False
+            convert_rgb_to_intensity=False  # Preserve RGB color
         )
         
-        # Integrate
+        # Integrate with color information
         self.volume.integrate(rgbd, intrinsic, extrinsic)
     
     def extract_mesh(self):
         """Extract mesh from the TSDF volume"""
-        return self.volume.extract_triangle_mesh()
+        mesh = self.volume.extract_triangle_mesh()
+        if mesh is not None:
+            mesh.compute_vertex_normals()
+        return mesh
     
     def extract_point_cloud(self):
         """Extract point cloud from the TSDF volume"""
-        return self.volume.extract_point_cloud()
+        pcd = self.volume.extract_point_cloud()
+        if pcd is not None:
+            pcd.estimate_normals()
+        return pcd
 
 class MultiKinectMeshReconstructor:
     def __init__(self, voxel_size=0.01):
@@ -616,13 +622,13 @@ class MultiKinectMeshReconstructor:
         if not self.extrinsic_calibration_done and len(point_clouds) >= 2:
             self.calibrate_cameras(point_clouds)
         
-        # Show individual point clouds with different colors
-        for i, pcd in enumerate(point_clouds):
-            temp_pcd = copy.deepcopy(pcd)
-            temp_pcd.paint_uniform_color(self.camera_colors[i])
-            if i > 0 and self.extrinsic_calibration_done and self.camera_extrinsics[i] is not None:
-                temp_pcd.transform(self.camera_extrinsics[i])
-            self.vis.add_geometry(temp_pcd)
+        # Show individual point clouds with different colors if requested
+        if self.show_original_clouds:
+            for i, pcd in enumerate(point_clouds):
+                temp_pcd = copy.deepcopy(pcd)
+                if i > 0 and self.extrinsic_calibration_done and self.camera_extrinsics[i] is not None:
+                    temp_pcd.transform(self.camera_extrinsics[i])
+                self.vis.add_geometry(temp_pcd)
         
         # If we have calibration, show the merged point cloud
         if self.extrinsic_calibration_done and len(point_clouds) >= 2:
@@ -633,12 +639,11 @@ class MultiKinectMeshReconstructor:
                     temp_pcd.transform(self.camera_extrinsics[i])
                     merged_pcd += temp_pcd
             
-            # Downsample the merged point cloud
+            # Downsample the merged point cloud while preserving colors
             merged_pcd = merged_pcd.voxel_down_sample(self.voxel_size)
             self.merged_pcd = merged_pcd
             
-            # Add the merged point cloud with a different color
-            merged_pcd.paint_uniform_color([0.5, 0.5, 0.5])  # Gray color
+            # Add the merged point cloud with original colors
             self.vis.add_geometry(merged_pcd)
         
         # Update renderer
