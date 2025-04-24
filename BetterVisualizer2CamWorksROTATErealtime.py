@@ -366,6 +366,11 @@ class MultiKinectMeshReconstructor:
         # Color mode states
         self.color_mode = "original"  # Options: "original", "uniform", "camera"
         
+        # Visualization state
+        self.geometries_added = False
+        self.individual_clouds = []
+        self.merged_cloud = None
+        
         os.makedirs(self.output_folder, exist_ok=True)
         
         # Flip transform for Kinect coordinate system
@@ -386,11 +391,6 @@ class MultiKinectMeshReconstructor:
         opt.point_size = 2.0
         opt.background_color = np.asarray([0.1, 0.1, 0.1])
         opt.show_coordinate_frame = True
-        
-        # Add visualization state tracking
-        self.geometries_added = False
-        self.individual_clouds = []
-        self.merged_cloud = None
 
     def register_callbacks(self):
         """Register keyboard callbacks for the visualizer"""
@@ -403,10 +403,10 @@ class MultiKinectMeshReconstructor:
             
         def save_current_state(vis):
             # Save point cloud
-            if self.merged_cloud is not None:
+            if self.merged_pcd is not None:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 pcd_path = os.path.join(self.output_folder, f"kinect_reconstruction_{timestamp}.ply")
-                o3d.io.write_point_cloud(pcd_path, self.merged_cloud)
+                o3d.io.write_point_cloud(pcd_path, self.merged_pcd)
                 print(f"Point cloud saved to {pcd_path}")
             
             # Save mesh if available
@@ -443,6 +443,11 @@ class MultiKinectMeshReconstructor:
             self.depth_trunc = max(0.5, self.depth_trunc - 0.5)
             print(f"Depth truncation decreased to: {self.depth_trunc}")
             return True
+
+        def reset_view(vis):
+            self.setup_camera_view()
+            print("View reset to default position")
+            return True
         
         # Register key callbacks
         self.vis.register_key_callback(ord("C"), cycle_color_mode)             # C to cycle color modes
@@ -452,6 +457,7 @@ class MultiKinectMeshReconstructor:
         self.vis.register_key_callback(ord("-"), decrease_depth_scale)         # - to decrease depth scale
         self.vis.register_key_callback(ord("]"), increase_depth_trunc)         # ] to increase depth truncation
         self.vis.register_key_callback(ord("["), decrease_depth_trunc)         # [ to decrease depth truncation
+        self.vis.register_key_callback(ord("1"), reset_view)                   # 1 to reset view
 
     def detect_cameras(self):
         """Detect available Kinect cameras"""
@@ -529,7 +535,9 @@ class MultiKinectMeshReconstructor:
         ctr.set_up([0.0, 1.0, 0.0])      # Up direction (fixed: y-axis is up)
         ctr.set_lookat([0.0, 0.0, 1.0])  # Look at point 1 meter in front
         ctr.set_zoom(0.7)                # Adjust zoom level
-        
+        ctr.set_constant_z_far(10.0)     # Set far clipping plane
+        ctr.set_constant_z_near(0.1)     # Set near clipping plane
+
     def process_frame(self, color_img, depth_img, intrinsic):
         """Process a single frame from the Kinect"""
         # Create RGBD image with current depth parameters
@@ -743,7 +751,7 @@ class MultiKinectMeshReconstructor:
         # Update renderer
         self.vis.poll_events()
         self.vis.update_renderer()
-
+    
     def run(self):
         """Main loop for Kinect streaming and reconstruction"""
         global running
@@ -780,11 +788,12 @@ class MultiKinectMeshReconstructor:
         print("  S - Save current reconstruction")
         print("  R - Recalibrate cameras")
         print("  Ctrl+C - Stop streaming")
+        
         print("\nCamera Controls:")
         print("  Left-click + drag - Rotate view")
         print("  Right-click + drag - Pan view")
         print("  Mouse wheel - Zoom in/out")
-        print("  R key - Reset camera view")
+        print("  1 - Reset camera view")
         
         try:
             while running:
@@ -799,7 +808,7 @@ class MultiKinectMeshReconstructor:
                     # Update visualization
                     self.update_visualization(frames)
                 
-                # Don't max out CPU
+                # Don't max out CPUS
                 time.sleep(0.01)
                 
         except Exception as e:
