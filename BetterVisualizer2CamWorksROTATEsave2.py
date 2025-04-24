@@ -402,20 +402,53 @@ class MultiKinectMeshReconstructor:
             return True
             
         def save_current_state(vis):
-            # Save point cloud
+            """Save the current reconstruction state"""
             if self.merged_pcd is not None:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                
+                # Save point cloud
                 pcd_path = os.path.join(self.output_folder, f"kinect_reconstruction_{timestamp}.ply")
                 o3d.io.write_point_cloud(pcd_path, self.merged_pcd)
                 print(f"Point cloud saved to {pcd_path}")
-            
-            # Save mesh if available
-            if self.integrated_mesh is not None:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                mesh_path = os.path.join(self.output_folder, f"kinect_reconstruction_{timestamp}.obj")
-                o3d.io.write_triangle_mesh(mesh_path, self.integrated_mesh)
-                print(f"Mesh saved to {mesh_path}")
-            
+                
+                # Create and save mesh
+                try:
+                    # Preprocess point cloud for mesh reconstruction
+                    pcd = copy.deepcopy(self.merged_pcd)
+                    
+                    # Remove statistical outliers
+                    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+                    
+                    # Estimate normals
+                    pcd.estimate_normals(
+                        o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 2, max_nn=30)
+                    )
+                    
+                    # Create mesh using Poisson surface reconstruction
+                    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                        pcd, depth=9, width=0, scale=1.1, linear_fit=False
+                    )[0]
+                    
+                    # Remove low density vertices
+                    densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                        pcd, depth=9, width=0, scale=1.1, linear_fit=False
+                    )[1]
+                    vertices_to_remove = densities < np.quantile(densities, 0.1)
+                    mesh.remove_vertices_by_mask(vertices_to_remove)
+                    
+                    # Compute vertex normals
+                    mesh.compute_vertex_normals()
+                    
+                    # Save mesh
+                    mesh_path = os.path.join(self.output_folder, f"kinect_reconstruction_{timestamp}.obj")
+                    o3d.io.write_triangle_mesh(mesh_path, mesh)
+                    print(f"Mesh saved to {mesh_path}")
+                    
+                except Exception as e:
+                    print(f"Error creating mesh: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
             return True
         
         def recalibrate_cameras(vis):
