@@ -11,6 +11,9 @@ from pyk4a import PyK4A, Config, ColorResolution, DepthMode
 import signal
 from queue import Queue
 
+# Default depth parameters
+DEFAULT_DEPTH_SCALE = 1000.0  # Azure Kinect depth is in mm
+DEFAULT_DEPTH_TRUNC = 3.0     # 3 meters max depth
 
 '''Need to add color to it still, it's for later'''
 # Global variables for graceful shutdown
@@ -310,8 +313,8 @@ class TSDFIntegration:
         depth_o3d = o3d.geometry.Image(depth_img)
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color_o3d, depth_o3d,
-            depth_scale=1000.0,  # Azure Kinect depth is in mm
-            depth_trunc=3.0,     # 3 meters max depth
+            depth_scale=DEFAULT_DEPTH_SCALE,  # Azure Kinect depth is in mm
+            depth_trunc=DEFAULT_DEPTH_TRUNC,     # 3 meters max depth
             convert_rgb_to_intensity=False  # Preserve RGB color
         )
         
@@ -336,11 +339,11 @@ class MultiKinectMeshReconstructor:
     def __init__(self, voxel_size=0.01):
         self.voxel_size = voxel_size
         self.mesh_converter = PointCloudToMesh(voxel_size)
-        self.registration = PointCloudRegistration(voxel_size * 3)  # Larger voxel size for registration
+        self.registration = PointCloudRegistration(voxel_size * 3)
         self.tsdf_integrator = TSDFIntegration(voxel_length=voxel_size, sdf_trunc=voxel_size*4)
-        self.visualization_mode = "pointcloud"  # Start with point cloud visualization
+        self.visualization_mode = "pointcloud"
         self.mesh_reconstruction = False
-        self.use_tsdf = True  # TSDF integration enabled by default
+        self.use_tsdf = True
         self.output_folder = "results"
         self.camera_threads = []
         self.found_devices = []
@@ -352,12 +355,15 @@ class MultiKinectMeshReconstructor:
             [0.7, 0.0, 0.0],  # Light Red for camera 0
             [0.0, 0.0, 0.7]   # Light Blue for camera 1
         ]
-        self.show_original_clouds = False  # Toggle to show unmerged clouds
+        self.show_original_clouds = False
         self.extrinsic_calibration_done = False
-        self.camera_extrinsics = []  # Store extrinsic matrices for each camera
+        self.camera_extrinsics = []
         
-        # New color mode states
-        self.use_colors = True  # Enable color by default
+        # Depth parameters
+        self.depth_scale = DEFAULT_DEPTH_SCALE
+        self.depth_trunc = DEFAULT_DEPTH_TRUNC
+        
+        # Color mode states
         self.color_mode = "original"  # Options: "original", "uniform", "camera"
         
         os.makedirs(self.output_folder, exist_ok=True)
@@ -378,10 +384,70 @@ class MultiKinectMeshReconstructor:
         # Set up render options
         opt = self.vis.get_render_option()
         opt.point_size = 2.0
-        opt.background_color = np.asarray([0.1, 0.1, 0.1])  # Dark gray background
-        opt.show_coordinate_frame = True  # Show coordinate frame
-    
-    # In the detect_cameras method, make sure we have better error handling
+        opt.background_color = np.asarray([0.1, 0.1, 0.1])
+        opt.show_coordinate_frame = True
+
+    def register_callbacks(self):
+        """Register keyboard callbacks for the visualizer"""
+        def cycle_color_mode(vis):
+            modes = ["original", "uniform", "camera"]
+            current_idx = modes.index(self.color_mode)
+            self.color_mode = modes[(current_idx + 1) % len(modes)]
+            print(f"Color mode: {self.color_mode}")
+            return True
+            
+        def save_current_state(vis):
+            # Save point cloud
+            if self.merged_pcd is not None:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                pcd_path = os.path.join(self.output_folder, f"kinect_reconstruction_{timestamp}.ply")
+                o3d.io.write_point_cloud(pcd_path, self.merged_pcd)
+                print(f"Point cloud saved to {pcd_path}")
+            
+            # Save mesh if available
+            if self.integrated_mesh is not None:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                mesh_path = os.path.join(self.output_folder, f"kinect_reconstruction_{timestamp}.obj")
+                o3d.io.write_triangle_mesh(mesh_path, self.integrated_mesh)
+                print(f"Mesh saved to {mesh_path}")
+            
+            return True
+        
+        def recalibrate_cameras(vis):
+            self.extrinsic_calibration_done = False
+            self.registration.initial_alignment_done = False
+            print("Camera calibration reset. Will recalibrate on next frame.")
+            return True
+
+        def increase_depth_scale(vis):
+            self.depth_scale += 100
+            print(f"Depth scale increased to: {self.depth_scale}")
+            return True
+
+        def decrease_depth_scale(vis):
+            self.depth_scale = max(100, self.depth_scale - 100)
+            print(f"Depth scale decreased to: {self.depth_scale}")
+            return True
+
+        def increase_depth_trunc(vis):
+            self.depth_trunc += 0.5
+            print(f"Depth truncation increased to: {self.depth_trunc}")
+            return True
+
+        def decrease_depth_trunc(vis):
+            self.depth_trunc = max(0.5, self.depth_trunc - 0.5)
+            print(f"Depth truncation decreased to: {self.depth_trunc}")
+            return True
+        
+        # Register key callbacks
+        self.vis.register_key_callback(ord("C"), cycle_color_mode)             # C to cycle color modes
+        self.vis.register_key_callback(ord("S"), save_current_state)           # S to save current state
+        self.vis.register_key_callback(ord("R"), recalibrate_cameras)          # R to recalibrate cameras
+        self.vis.register_key_callback(ord("="), increase_depth_scale)         # = to increase depth scale
+        self.vis.register_key_callback(ord("-"), decrease_depth_scale)         # - to decrease depth scale
+        self.vis.register_key_callback(ord("]"), increase_depth_trunc)         # ] to increase depth truncation
+        self.vis.register_key_callback(ord("["), decrease_depth_trunc)         # [ to decrease depth truncation
+
     def detect_cameras(self):
         """Detect available Kinect cameras"""
         self.found_devices = []
@@ -459,53 +525,16 @@ class MultiKinectMeshReconstructor:
         ctr.set_lookat([0.0, 0.0, 1.0])  # Look at point 1 meter in front
         ctr.set_zoom(0.7)                # Adjust zoom level
         
-    def register_callbacks(self):
-        """Register keyboard callbacks for the visualizer"""
-        def cycle_color_mode(vis):
-            modes = ["original", "uniform", "camera"]
-            current_idx = modes.index(self.color_mode)
-            self.color_mode = modes[(current_idx + 1) % len(modes)]
-            print(f"Color mode: {self.color_mode}")
-            return True
-            
-        def save_current_state(vis):
-            # Save point cloud
-            if self.merged_pcd is not None:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                pcd_path = os.path.join(self.output_folder, f"kinect_reconstruction_{timestamp}.ply")
-                o3d.io.write_point_cloud(pcd_path, self.merged_pcd)
-                print(f"Point cloud saved to {pcd_path}")
-            
-            # Save mesh if available
-            if self.integrated_mesh is not None:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                mesh_path = os.path.join(self.output_folder, f"kinect_reconstruction_{timestamp}.obj")
-                o3d.io.write_triangle_mesh(mesh_path, self.integrated_mesh)
-                print(f"Mesh saved to {mesh_path}")
-            
-            return True
-        
-        def recalibrate_cameras(vis):
-            self.extrinsic_calibration_done = False
-            self.registration.initial_alignment_done = False
-            print("Camera calibration reset. Will recalibrate on next frame.")
-            return True
-        
-        # Register key callbacks
-        self.vis.register_key_callback(ord("C"), cycle_color_mode)             # C to cycle color modes
-        self.vis.register_key_callback(ord("S"), save_current_state)           # S to save current state
-        self.vis.register_key_callback(ord("R"), recalibrate_cameras)          # R to recalibrate cameras
-    
     def process_frame(self, color_img, depth_img, intrinsic):
         """Process a single frame from the Kinect"""
-        # Create RGBD image
+        # Create RGBD image with current depth parameters
         color_o3d = o3d.geometry.Image(color_img)
         depth_o3d = o3d.geometry.Image(depth_img)
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color_o3d, depth_o3d,
             convert_rgb_to_intensity=False,
-            depth_scale=1000.0,  # Azure Kinect depth is in mm
-            depth_trunc=3.0      # 3 meters max depth
+            depth_scale=self.depth_scale,
+            depth_trunc=self.depth_trunc
         )
         
         # Create point cloud
@@ -698,6 +727,8 @@ class MultiKinectMeshReconstructor:
         
         print("\nControls:")
         print("  C - Cycle color modes (original/uniform/camera)")
+        print("  =/- - Adjust depth scale (current: {:.1f})".format(self.depth_scale))
+        print("  [/] - Adjust depth truncation (current: {:.1f}m)".format(self.depth_trunc))
         print("  S - Save current reconstruction")
         print("  R - Recalibrate cameras")
         print("  Ctrl+C - Stop streaming")
